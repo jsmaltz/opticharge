@@ -1,0 +1,40 @@
+# Tesla / Home energy
+tesla_email: ""
+tesla_password: ""
+tesla_refresh_token: ""
+
+# Hyundai BlueLink (for EV status)
+bluelink_user: ""
+bluelink_pass: ""
+bluelink_pin:  ""              # required in the US
+bluelink_region: "USA"      # for hyundai-kia-connect-api
+bluelink_brand: "Hyundai"      # for hyundai-kia-connect-api
+
+# Vehicle VIN (for status queries)
+vehicle_vin: ""
+
+# Wallbox Pulsar Plus (using the 'wallbox' PyPI lib)
+wallbox_user: ""
+wallbox_pass: ""
+wallbox_region: "us"         # e.g. 'eu', 'us'
+
+# Polling & logging
+poll_interval: 300           # how often to poll sensors (in seconds)
+log_level: "INFO"            # DEBUG, INFO, WARNING, ERROR
+
+# Charger & power parameters
+voltage: 240                 # system voltage in volts
+step_size: 1                 # amps per step supported by charger
+min_amps: 6                  # minimum charging current
+max_amps: 32                 # max charging current your charger supports
+hysteresis_watts: 250        # deadband to avoid rapid toggling (in watts)
+default_amps: 9
+grid_charge_start_hour: 23
+grid_charge_end_hour: 6
+
+# State-of-Charge thresholds
+ev_target_soc: 80            # % to hit before stopping charge
+battery_min_soc: 20          # % below which Powerwall should get priority
+
+# EV battery capacity
+ev_battery_capacity_kwh: 84.0

@@ -330,29 +330,6 @@ class BlueLinkSensor:
 
         return self._call_with_reauth(_do)
 
-    def set_ac_target_soc_rem(self, soc_level: int) -> dict:
-        """
-        Set the AC charging target SOC percentage.
-
-        soc_level: int, 50–100 (Hyundai won't allow <50)
-        """
-        if not (50 <= soc_level <= 100):
-            raise ValueError("SOC level must be between 50 and 100")
-
-        def _do():
-            token_obj = self.vm.api.login(self.username, self.password)
-            vehicle = self.vm.get_vehicle(self.vehicle_id)
-            # This assumes your API object has a method to set charge limits; 
-            # adjust the name/params if your API differs.
-            return self.vm.api.set_charge_limits(
-                token_obj,
-                vehicle,
-                plug_type=0,  # 0 = AC
-                target_soc=soc_level
-            )
-
-        return self._call_with_reauth(_do)
-
 class WallboxCharger:
     def __init__(self, username: str, password: str):
         self.client = Wallbox(username, password)

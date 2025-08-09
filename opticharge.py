@@ -12,6 +12,7 @@ import teslapy
 import requests
 import certifi
 import time
+import random
 
 from hyundai_kia_connect_api import VehicleManager, const
 from datetime import datetime, timedelta
@@ -21,6 +22,10 @@ from enum import Enum, auto
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
 #logging.getLogger("urllib3").setLevel(logging.DEBUG)
+
+
+class TransientAPIError(Exception):
+    pass
 
 class ChargeState(Enum):
     UNPLUGGED = auto()
@@ -230,6 +235,43 @@ class BlueLinkSensor:
             raise RuntimeError(f"VIN '{vin}' not found; available VINs: {available}")
 
     def _call_with_reauth(self, func: callable):
+        # Run func(), retrying on auth/rate-limit and transient payload errors.
+
+        for attempt in range(3):
+            try:
+                return func()
+            except requests.exceptions.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                if code == 401:
+                    print("BlueLink 401 ? reauth?")
+                    self.authenticate()
+                    continue
+                if code == 429:
+                    wait = 6 + attempt * 4
+                    print(f"BlueLink 429 ? backoff {wait}s?")
+                    time.sleep(wait)
+                    continue
+                raise  # non-retryable HTTP
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+                # SDK saw an unexpected/missing field; treat as transient
+                print(f"BlueLink transient payload error ({type(e).__name__}): {e}. Retrying?")
+                time.sleep(2 + attempt)
+                # On first payload error, a reauth often helps
+                if attempt == 0:
+                    try:
+                        self.authenticate()
+                    except Exception:
+                        pass
+                continue
+            except Exception as e:
+                # last resort ? one quick retry then surface
+                print(f"BlueLink unexpected error: {e}. Retrying once?")
+                time.sleep(2)
+                continue
+        # Final attempt without swallowing
+        return func()
+
+    def _call_with_reauth_rem(self, func: callable):
         for attempt in range(2):
             try:
                 return func()
@@ -262,6 +304,45 @@ class BlueLinkSensor:
         return self._call_with_reauth(_do)
 
     def get_vehicle_status(self) -> dict:
+        def _do():
+            now = time.time()
+            can_refresh = now >= getattr(self, "_skip_next_refresh_until", 0)
+            if can_refresh:
+                try:
+                    self.vm.update_vehicle_with_cached_state(self.vehicle_id)
+                except Exception as e:
+                    print(f"refresh failed: {e}. Cooling off 30s.")
+                    self._skip_next_refresh_until = now + 30
+
+            car = self.vm.get_vehicle(self.vehicle_id)
+
+            target_ac = getattr(car, "ev_charge_limits_ac", None)
+            target_dc = getattr(car, "ev_charge_limits_dc", None)
+            charging_power_kW = getattr(car, "ev_charging_power", None)
+            
+            # try per-plug list if present
+            try:
+                rci = (car.data or {}).get("vehicleStatus", {}).get("evStatus", {}).get("reservChargeInfos", {}) or {}
+                tslist = rci.get("targetSOClist", []) or []
+                for item in tslist:
+                    if item.get("plugType") == 0:
+                        target_ac = item.get("targetSOClevel", target_ac)
+                    elif item.get("plugType") == 1:
+                        target_dc = item.get("targetSOClevel", target_dc)
+            except Exception:
+                pass
+
+            return {
+                "plugged_in": bool(getattr(car, "ev_battery_is_plugged_in", False)),
+                "charging":   bool(getattr(car, "ev_battery_is_charging", False)),
+                "soc":        getattr(car, "ev_battery_percentage", None),
+                "target_ac":  target_ac,
+                "target_dc":  target_dc,
+                "charging_power_kW": charging_power_kW
+            }
+        return self._call_with_reauth(_do)
+
+    def get_vehicle_status_rem(self) -> dict:
         def _do():
 
             self.vm.update_vehicle_with_cached_state(self.vehicle_id)
@@ -455,162 +536,187 @@ def start(ctx):
         return now.hour >= start_hour or now.hour < end_hour
 
     last_set_current = None
+    state = None
+
+    consec_errors = 0
+    max_backoff = 60  # seconds
+
+    poll_s = int(cfg.get("poll_interval", 300))      # seconds between checks
+    jitter_s = float(cfg.get("poll_jitter_s", 0.5))   # optional random spread
+
+    # start immediately
+    next_tick = time.monotonic()
 
     while True:
-        date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-        print(date_str)
-        readings = tesla.get_house_power()
-        ev_status = bluelink.get_vehicle_status()
-        charger_status = charger.get_status()
-        print({
-            "solar_power": readings["solar_power"],
-            "house_load": readings["house_load"],
-            "battery_soc": readings.get("battery_soc"),
-            "ev_soc": ev_status.get("soc"),
-        })
-        print(charger_status)
+        try:
+            date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+            print(date_str)
+            readings = tesla.get_house_power()
+            ev_status = bluelink.get_vehicle_status()
+            charger_status = charger.get_status()
+            print({
+                "solar_power": readings["solar_power"],
+                "house_load": readings["house_load"],
+                "battery_soc": readings.get("battery_soc"),
+                "ev_soc": ev_status.get("soc"),
+                "ev_charging": ev_status.get("charging"),
+                "ev_charging_power_kW": ev_status.get("charging_power_kW")
+            })
+            print(f"Charger status: {charger_status}")
 
-        if ev_status["plugged_in"]:
-            # 1) Determine desired target SOC (bump to surplus target on strong solar)
-            evse_w = _evse_power_watts(charger_status, cfg)
-            base_house = max(0.0, readings["house_load"] - evse_w)  # house load excluding EVSE
-            headroom   = readings["solar_power"] - base_house
+            if ev_status["plugged_in"]:
+                # 1) Determine desired target SOC (bump to surplus target on strong solar)
+                evse_w = _evse_power_watts(charger_status, cfg)
+                base_house = max(0.0, readings["house_load"] - evse_w)  # house load excluding EVSE
+                headroom   = readings["solar_power"] - base_house
 
-            print({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
+                print({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
 
-            batt_soc = readings.get("battery_soc", 0)
-            desired_target = cfg["ev_target_soc"]
-            surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
-            if headroom > engine.hysteresis and batt_soc >= 99:
-                desired_target = surplus_target
+                batt_soc = readings.get("battery_soc", 0)
+                desired_target = cfg["ev_target_soc"]
+                surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
+                if headroom > engine.hysteresis and batt_soc >= 99:
+                    desired_target = surplus_target
 
-            # 2) Ensure AC target SOC matches desired_target (apply once per mismatch)
-            try:
-                ac_soc_value = bluelink.get_ac_target_soc()
-            except Exception:
-                ac_soc_value = None
-            if ac_soc_value != desired_target and (time.time() - last_cmd_ts) > MIN_CMD_INTERVAL:
-                bluelink.set_ac_target_soc(desired_target)
-                last_cmd_ts = time.time()
+                # 2) Ensure AC target SOC matches desired_target (apply once per mismatch)
+                try:
+                    ac_soc_value = bluelink.get_ac_target_soc()
+                except Exception:
+                    ac_soc_value = None
+                if ac_soc_value != desired_target and (time.time() - last_cmd_ts) > MIN_CMD_INTERVAL:
+                    bluelink.set_ac_target_soc(desired_target)
+                    last_cmd_ts = time.time()
 
-            # 3) Classify state: TARGET_REACHED, CHARGING_GRID, CHARGING_SOLAR, WAIT_SOLAR, UNPLUGGED
-            ev_charge_level = ev_status.get("soc") or 0
-            now = datetime.now()
-            in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
-            target_reached = ev_charge_level >= desired_target
+                # 3) Classify state: TARGET_REACHED, CHARGING_GRID, CHARGING_SOLAR, WAIT_SOLAR, UNPLUGGED
+                ev_charge_level = ev_status.get("soc") or 0
+                now = datetime.now()
+                in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
+                target_reached = ev_charge_level >= desired_target
 
-            # decide amps for grid window if applicable
-            grid_amps = None
-            if in_grid_window and ev_charge_level < cfg["ev_target_soc"]:
-                if cfg.get("grid_charge_fast", False):
-                    grid_amps = cfg["grid_charge_fast_amps"]
-                else:
-                    # compute the minimum amps to reach target by end of window (fallback to max if unknown)
-                    try:
-                        # end-of-window absolute datetime
-                        end = now.replace(hour=cfg["grid_charge_end_hour"], minute=0, second=0, microsecond=0)
-                        if not _in_window(now, cfg["grid_charge_end_hour"], cfg["grid_charge_start_hour"]):
-                            # ensure end is “next” window end if we’re already past it today
-                            if (cfg["grid_charge_start_hour"] > cfg["grid_charge_end_hour"] and now.hour >= cfg["grid_charge_end_hour"]) \
-                               or (cfg["grid_charge_start_hour"] <= cfg["grid_charge_end_hour"] and now.hour >= cfg["grid_charge_end_hour"]):
-                                end += timedelta(days=1)
-                        hours_left = max(0.1, (end - now).total_seconds() / 3600.0)  # prevent div/0
-                        if "ev_battery_capacity_kwh" in cfg:
-                            needed_kwh = max(0.0, (cfg["ev_target_soc"] - ev_charge_level) / 100.0 * cfg["ev_battery_capacity_kwh"])
-                            amps = int(needed_kwh * 1000.0 / (cfg["voltage"] * hours_left))
-                            grid_amps = max(cfg["min_amps"], min(cfg["max_amps"], amps))
-                        else:
-                            grid_amps = cfg["max_amps"]
-                    except Exception:
-                        grid_amps = cfg["max_amps"]
-
-            # state resolution
-            if not ev_status.get("plugged_in"):
-                state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
-            elif target_reached:
-                state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
-            elif in_grid_window and grid_amps:
-                state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
-            # --- Maintenance: reconcile EVSE amps even without a state transition ---
-
-            if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
-                # decide target amps for this state
-                desired_a = amps_wanted
-                if desired_a is None:
-                    # belt & suspenders fallback
-                    desired_a = engine.compute_amps(readings_eff)[0]
-
-                # current reading from EVSE
-                cur_a  = int(charger_status.get("current") or cfg.get("default_amps", 6))
-
-                # smoothing / quantization
-                step   = int(cfg.get("amp_step", 1))
-                ramp   = int(cfg.get("ramp_limit_amps", 6))
-                min_dA = int(cfg.get("min_delta_amps", 1))
-                max_a  = int(cfg.get("max_amps", 40))
-                min_a  = int(cfg.get("min_amps", 6))
-
-                desired_a = max(min_a, min(max_a, desired_a))
-                # quantize to step
-                desired_a = (desired_a // step) * step
-
-                # only act if changed meaningfully and not already what we set last time
-                if (abs(desired_a - cur_a) >= min_dA) and (desired_a != last_set_current):
-                    # ramp to avoid big jumps
-                    if desired_a > cur_a:
-                        desired_a = min(cur_a + ramp, desired_a)
+                # decide amps for grid window if applicable
+                grid_amps = None
+                if in_grid_window and ev_charge_level < cfg["ev_target_soc"]:
+                    if cfg.get("grid_charge_fast", False):
+                        grid_amps = cfg["grid_charge_fast_amps"]
                     else:
-                        desired_a = max(cur_a - ramp, desired_a)
+                        # compute the minimum amps to reach target by end of window (fallback to max if unknown)
+                        try:
+                            # end-of-window absolute datetime
+                            end = now.replace(hour=cfg["grid_charge_end_hour"], minute=0, second=0, microsecond=0)
+                            if not _in_window(now, cfg["grid_charge_end_hour"], cfg["grid_charge_start_hour"]):
+                                # ensure end is “next” window end if we’re already past it today
+                                if (cfg["grid_charge_start_hour"] > cfg["grid_charge_end_hour"] and now.hour >= cfg["grid_charge_end_hour"]) \
+                                   or (cfg["grid_charge_start_hour"] <= cfg["grid_charge_end_hour"] and now.hour >= cfg["grid_charge_end_hour"]):
+                                    end += timedelta(days=1)
+                            hours_left = max(0.1, (end - now).total_seconds() / 3600.0)  # prevent div/0
+                            if "ev_battery_capacity_kwh" in cfg:
+                                needed_kwh = max(0.0, (cfg["ev_target_soc"] - ev_charge_level) / 100.0 * cfg["ev_battery_capacity_kwh"])
+                                amps = int(needed_kwh * 1000.0 / (cfg["voltage"] * hours_left))
+                                grid_amps = max(cfg["min_amps"], min(cfg["max_amps"], amps))
+                            else:
+                                grid_amps = cfg["max_amps"]
+                        except Exception:
+                            grid_amps = cfg["max_amps"]
 
-                    charger.set_current(desired_a)
-                    last_set_current = desired_a
-                    last_cmd_ts = time.time()
+                # state resolution
+                if not ev_status.get("plugged_in"):
+                    state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
+                elif target_reached:
+                    state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
+                elif in_grid_window and grid_amps:
+                    state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
+                # --- Maintenance: reconcile EVSE amps even without a state transition ---
 
-                # ensure charge session is running
-                if not ev_status.get("charging"):
-                    bluelink.start_charge()
-                    last_cmd_ts = time.time()
-
-            else:
-                # normal solar headroom mode
-                readings_eff = dict(readings)
-                readings_eff["house_load"] = base_house
-                amps_calc, do_charge = engine.compute_amps(readings_eff)
-                if do_charge:
-                    state = "CHARGING_SOLAR"; amps_wanted = amps_calc; reason = "solar surplus"
-                else:
-                    state = "WAIT_SOLAR"; amps_wanted = None; reason = "waiting for solar"
-
-            print(f"STATE={state} ({reason})")
-
-            # 4) Act only on transitions or after cooldown to avoid thrash
-            now_ts = time.time()
-            should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and ev_status.get("charging") and not in_grid_window
-            should_act = (state != last_state) or ((now_ts - last_cmd_ts) > MIN_STARTSTOP_INTERVAL) or should_stop_now
-
-            if should_act:
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
-                    if amps_wanted is None:
-                        # final belt & suspenders
-                        amps_wanted = engine.compute_amps(readings)[0]
-                    charger.set_current(amps_wanted)
+                    # decide target amps for this state
+                    desired_a = amps_wanted
+                    if desired_a is None:
+                        # belt & suspenders fallback
+                        desired_a = engine.compute_amps(readings_eff)[0]
+
+                    # current reading from EVSE
+                    cur_a  = int(charger_status.get("current") or cfg.get("default_amps", 6))
+
+                    # smoothing / quantization
+                    step   = int(cfg.get("amp_step", 1))
+                    ramp   = int(cfg.get("ramp_limit_amps", 6))
+                    min_dA = int(cfg.get("min_delta_amps", 1))
+                    max_a  = int(cfg.get("max_amps", 40))
+                    min_a  = int(cfg.get("min_amps", 6))
+
+                    desired_a = max(min_a, min(max_a, desired_a))
+                    # quantize to step
+                    desired_a = (desired_a // step) * step
+
+                    # only act if changed meaningfully and not already what we set last time
+                    if (abs(desired_a - cur_a) >= min_dA) and (desired_a != last_set_current):
+                        # ramp to avoid big jumps
+                        if desired_a > cur_a:
+                            desired_a = min(cur_a + ramp, desired_a)
+                        else:
+                            desired_a = max(cur_a - ramp, desired_a)
+
+                        charger.set_current(desired_a)
+                        last_set_current = desired_a
+                        last_cmd_ts = time.time()
+
+                    # ensure charge session is running
                     if not ev_status.get("charging"):
                         bluelink.start_charge()
-                    last_cmd_ts = now_ts
+                        last_cmd_ts = time.time()
 
-                elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
-                    if ev_status.get("charging"):
-                        charger.set_current(cfg["default_amps"])
-                        bluelink.stop_charge()
+                else:
+                    # normal solar headroom mode
+                    readings_eff = dict(readings)
+                    readings_eff["house_load"] = base_house
+                    amps_calc, do_charge = engine.compute_amps(readings_eff)
+                    if do_charge:
+                        state = "CHARGING_SOLAR"; amps_wanted = amps_calc; reason = "solar surplus"
+                    else:
+                        state = "WAIT_SOLAR"; amps_wanted = None; reason = "waiting for solar"
+
+                print(f"STATE={state} ({reason})")
+
+                # 4) Act only on transitions or after cooldown to avoid thrash
+                now_ts = time.time()
+                should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and ev_status.get("charging") and not in_grid_window
+                should_act = (state != last_state) or ((now_ts - last_cmd_ts) > MIN_STARTSTOP_INTERVAL) or should_stop_now
+
+                if should_act:
+                    if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
+                        if amps_wanted is None:
+                            # final belt & suspenders
+                            amps_wanted = engine.compute_amps(readings)[0]
+                        charger.set_current(amps_wanted)
+                        if not ev_status.get("charging"):
+                            bluelink.start_charge()
                         last_cmd_ts = now_ts
 
-                # UNPLUGGED or anything else → no action
-                last_state = state
+                    elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
+                        if ev_status.get("charging"):
+                            charger.set_current(cfg["default_amps"])
+                            bluelink.stop_charge()
+                            last_cmd_ts = now_ts
 
-        else:
-            click.echo("Vehicle not plugged in; skipping")
+                    # UNPLUGGED or anything else → no action
+                    last_state = state
+
+            else:
+                click.echo("Vehicle not plugged in; skipping")
+            consec_errors = 0
+
+        except KeyboardInterrupt:
+            print("Exiting on Ctrl+C"); break
+                
+        except Exception as e:
+            consec_errors += 1
+            backoff = min(2 * consec_errors, max_backoff)
+            print(f"Tick error ({type(e).__name__}): {e}. Backing off {backoff}s, then continuing.")
+            time.sleep(backoff)
             
-        time.sleep(interval)
-
+        # normal sleep to next tick (your poll_interval + jitter)
+        next_tick += poll_s
+        time.sleep(max(0, next_tick - time.monotonic()) + random.uniform(0, jitter_s))
+        
 if __name__ == '__main__':
     cli()

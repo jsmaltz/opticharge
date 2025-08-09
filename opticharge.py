@@ -184,66 +184,119 @@ class BlueLinkSensor:
                          for v in self.vm.vehicles.values()]
             raise RuntimeError(f"VIN '{vin}' not found; available VINs: {available}")
         
-    def _call_with_reauth(self, func, *args, **kwargs):
+    def _call_with_reauth(self, func: callable):
         try:
-            return func(*args, **kwargs)
+            return func()
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
                 print("Bluelink session expired. Re-authenticating...")
                 self.authenticate()
-                return func(*args, **kwargs)
+                return func()
             elif e.response.status_code == 429:
                 print("Bluelink rate limit hit (429). Sleeping and retrying once...")
                 time.sleep(10)  # backoff to avoid hammering
-                return func(*args, **kwargs)
+                return func()
             else:
                 raise
             
     def start_charge(self) -> dict:
-        """
-        Tell the Hyundai Ioniq to begin charging immediately via OEM /control/reservecharge.
-        """
-        # 1) Login directly against the SPA API and get the token object
-        token_obj = self.vm.api.login(self.username, self.password)  
+        """Tell the Hyundai Ioniq to begin charging immediately."""
+        def _do():
+            token_obj = self.vm.api.login(self.username, self.password)
+            vehicle   = self.vm.get_vehicle(self.vehicle_id)
+            return self.vm.api.start_charge(token_obj, vehicle)
+        return self._call_with_reauth(_do)
 
-        # 2) Grab the Vehicle so we can build headers
-        vehicle = self.vm.get_vehicle(self.vehicle_id)
-
-        result = self.vm.api.start_charge(token_obj, vehicle)
-
-        print(result)
-        
-        return result
 
     def stop_charge(self) -> dict:
-        """
-        Tell the Hyundai Ioniq to stop charging immediately.
-        """
-        # 1) Re-login to get a fresh Token object
-        token_obj = self.vm.api.login(self.username, self.password)  
-
-        # 2) Get the Vehicle instance
-        vehicle = self.vm.get_vehicle(self.vehicle_id)
-
-        # 3) Call the built-in helper; it wraps the POST to /control/reservecharge with reservChargeSet=0
-        result = self.vm.api.stop_charge(token_obj, vehicle)
-
-        return result
+        """Tell the Hyundai Ioniq to stop charging immediately."""
+        def _do():
+            token_obj = self.vm.api.login(self.username, self.password)
+            vehicle   = self.vm.get_vehicle(self.vehicle_id)
+            return self.vm.api.stop_charge(token_obj, vehicle)
+        return self._call_with_reauth(_do)
 
     def get_vehicle_status(self) -> dict:
-        # Refresh cached state
-        self.vm.update_vehicle_with_cached_state(self.vehicle_id)
-        car = self.vm.get_vehicle(self.vehicle_id)
-        # These attrs exist on the Vehicle object:
-        plugged = getattr(car, 'ev_battery_is_plugged_in', False)
-        charging = getattr(car, 'ev_battery_is_charging', False)
-        soc = getattr(car, 'ev_battery_percentage', None)
+        def _do():
+            self.vm.update_vehicle_with_cached_state(self.vehicle_id)
+            car = self.vm.get_vehicle(self.vehicle_id)
+            target_ac = next(item["targetSOClevel"] 
+                 for item in car.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"] 
+                 if item["plugType"] == 0)
 
-        return {
-            'plugged_in': plugged,
-            'charging':   charging,
-            'soc':        soc
-        }
+            target_dc = next(item["targetSOClevel"] 
+                 for item in car.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"] 
+                 if item["plugType"] == 1)
+            
+            return {
+                'plugged_in': getattr(car, 'ev_battery_is_plugged_in', False),
+                'charging':   getattr(car, 'ev_battery_is_charging', False),
+                'soc':        getattr(car, 'ev_battery_percentage', None),
+                'target_ac': target_ac,
+                'target_dc': target_dc                
+            }
+        return self._call_with_reauth(_do)
+
+    def get_ac_target_soc(self) -> int | None:
+        """
+        Return the AC charging target SOC percentage (or None if unavailable).
+        """
+        def _do():
+            # refresh cached state, then read
+            self.vm.update_vehicle_with_cached_state(self.vehicle_id)
+            vehicle = self.vm.get_vehicle(self.vehicle_id)
+
+            try:
+                target_soc_list = vehicle.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
+                return next(item["targetSOClevel"] for item in target_soc_list if item.get("plugType") == 0)
+            except Exception:
+                # Fallback to top-level shortcut if the detailed list isn't present
+                return getattr(vehicle, "ev_charge_limits_ac", None)
+
+        return self._call_with_reauth(_do)
+
+    def set_ac_target_soc(self, soc_level: int) -> dict:
+        """
+        Set the AC charging target SOC percentage, preserving the current DC limit.
+        """
+        if not (50 <= soc_level <= 100):
+            raise ValueError("SOC level must be between 50 and 100")
+
+        def _do():
+            token_obj = self.vm.api.login(self.username, self.password)
+            vehicle = self.vm.get_vehicle(self.vehicle_id)
+
+            # Read current DC target from vehicle data
+            target_soc_list = vehicle.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
+            dc_limit = next(item["targetSOClevel"] for item in target_soc_list if item["plugType"] == 1)
+
+            # set_charge_limits(api_token, vehicle_obj, ac_limit, dc_limit)
+            return self.vm.api.set_charge_limits(token_obj, vehicle, soc_level, dc_limit)
+
+        return self._call_with_reauth(_do)
+
+    def set_ac_target_soc_rem(self, soc_level: int) -> dict:
+        """
+        Set the AC charging target SOC percentage.
+
+        soc_level: int, 50–100 (Hyundai won't allow <50)
+        """
+        if not (50 <= soc_level <= 100):
+            raise ValueError("SOC level must be between 50 and 100")
+
+        def _do():
+            token_obj = self.vm.api.login(self.username, self.password)
+            vehicle = self.vm.get_vehicle(self.vehicle_id)
+            # This assumes your API object has a method to set charge limits; 
+            # adjust the name/params if your API differs.
+            return self.vm.api.set_charge_limits(
+                token_obj,
+                vehicle,
+                plug_type=0,  # 0 = AC
+                target_soc=soc_level
+            )
+
+        return self._call_with_reauth(_do)
 
 class WallboxCharger:
     def __init__(self, username: str, password: str):
@@ -276,7 +329,7 @@ class WallboxCharger:
         # This will send the HTTP request to change the current
         result = self._call_with_reauth(self.client.setMaxChargingCurrent, self.charger_id, amps)
 
-        print(f"DEBUG: setMaxChargingCurrent returned: {result}")
+        #print(f"DEBUG: setMaxChargingCurrent returned: {result}")
         return result
     
     def get_status(self) -> dict:
@@ -323,6 +376,7 @@ def cli(ctx, config):
 @click.pass_context
 def start(ctx):
     cfg = ctx.obj
+
      # Initialize sensors and controllers
     tesla = TeslaSensor(
     refresh_token=cfg["tesla_refresh_token"],
@@ -345,6 +399,9 @@ def start(ctx):
     interval = cfg.get('poll_interval', 300)
 
     click.echo('Starting controller loop...')
+
+    target_soc = cfg['ev_target_soc']
+    
     while True:
         date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         print(date_str)
@@ -361,26 +418,46 @@ def start(ctx):
             headroom = readings['solar_power'] - readings['house_load']
             batt_soc = readings.get('battery_soc', 0)
             print(f'Powerwall charge level {batt_soc}')
-            target_soc = cfg['ev_target_soc']
             if headroom > engine.hysteresis and batt_soc >= 99:
-                target_soc = 100
+                target_soc = cfg['ev_target_soc_solar_surplus']
+                print(f"Powerwall is fully charged and solar is available. Increasing maximum charge level on vehicle to {target_soc}%")
+                bluelink.set_ac_target_soc(target_soc)
+                time.sleep(2)
+                ac_soc_value = bluelink.get_ac_target_soc()
+                print(f"EV AC charging target now set at: {ac_soc_value}")                
+                bluelink.start_charge()
+            else:
+                target_soc = cfg['ev_target_soc']
+                ac_soc_value = bluelink.get_ac_target_soc()
+                if ac_soc_value != target_soc:
+                    bluelink.set_ac_target_soc(target_soc)
+                    
             # Time-based override after 11 PM or start of off-peak
             now = datetime.now()
             if now.hour >= cfg['grid_charge_start_hour'] and ev_charge_level < cfg['ev_target_soc']:
-                # calculate hours until next 6 AM or similar end of off-peak
-                next_six = now.replace(hour=cfg['grid_charge_end_hour'], minute=0, second=0, microsecond=0)
-                if now.hour >= cfg['grid_charge_end_hour']:
-                    next_six += timedelta(days=1)
-                hours_left = (next_six - now).total_seconds() / 3600
-                # estimate amps (fallback to max if capacity unknown)
-                if 'ev_battery_capacity_kwh' in cfg:
-                    needed_kwh = (cfg['ev_target_soc'] - ev_charge_level) / 100 * cfg['ev_battery_capacity_kwh']
-                    amps = int(needed_kwh * 1000 / (cfg['voltage'] * hours_left))
-                    amps = max(cfg['min_amps'], min(cfg['max_amps'], amps))
+                if cfg['grid_charge_fast']==True:
+                    # inverter and charging may be more efficient at higher currents
+                    # if that is the case, set this parameter to a high amperage
+                    amps = cfg['grid_charge_fast_amps']
                 else:
-                    amps = cfg['max_amps']
+                    # if we want to charge slowly because of other loads, or if this is more efficient
+                    # calculate hours until next 6 AM or similar end of off-peak
+                    next_six = now.replace(hour=cfg['grid_charge_end_hour'], minute=0, second=0, microsecond=0)
+                    if now.hour >= cfg['grid_charge_end_hour']:
+                        next_six += timedelta(days=1)
+                    hours_left = (next_six - now).total_seconds() / 3600
+                    # estimate amps (fallback to max if capacity unknown)
+                    if 'ev_battery_capacity_kwh' in cfg:
+                        needed_kwh = (cfg['ev_target_soc'] - ev_charge_level) / 100 * cfg['ev_battery_capacity_kwh']
+                        amps = int(needed_kwh * 1000 / (cfg['voltage'] * hours_left))
+                        amps = max(cfg['min_amps'], min(cfg['max_amps'], amps))
+                        click.echo(f"Set timed charger to {amps} A to reach {cfg['ev_target_soc']}% by 6 AM (in {hours_left:.1f}h)")
+                    else:
+                        amps = cfg['max_amps']
+                        click.echo(f"Set charger to {amps} A, target is {target_soc}")
+                                   
                 charger.set_current(amps)
-                click.echo(f"Set timed charger to {amps} A to reach {cfg['ev_target_soc']}% by 6 AM (in {hours_left:.1f}h)")
+
                 bluelink.start_charge()
 
             elif ev_charge_level < target_soc:
@@ -397,9 +474,9 @@ def start(ctx):
                         charger.set_current(cfg['default_amps'])
                         print('Stopping charging.')
                         bluelink.stop_charge()
-                        breakpoint()
             else:
-                click.echo("Target SOC reached; throttling to minimum")
+                click.echo(f"Target SOC {target_soc} reached; throttling to minimum")
+                breakpoint()
                 bluelink.stop_charge()
         else:
             click.echo("Vehicle not plugged in; skipping")

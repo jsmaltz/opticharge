@@ -26,15 +26,16 @@ log_level: "INFO"            # DEBUG, INFO, WARNING, ERROR
 voltage: 240                 # system voltage in volts
 step_size: 1                 # amps per step supported by charger
 min_amps: 6                  # minimum charging current
-max_amps: 32                 # max charging current your charger supports
+max_amps: 40                 # max charging current your charger supports
 hysteresis_watts: 250        # deadband to avoid rapid toggling (in watts)
 default_amps: 9
 grid_charge_start_hour: 23
 grid_charge_end_hour: 6
-
+grid_charge_fast : True
+grid_charge_fast_amps : 40
 # State-of-Charge thresholds
-ev_target_soc: 80            # % to hit before stopping charge
-battery_min_soc: 20          # % below which Powerwall should get priority
+ev_target_soc: 80            # % to hit before stopping
+ev_target_soc_solar_surplus: 100 # go higher instead of sending back to grid
 
 # EV battery capacity
 ev_battery_capacity_kwh: 84.0

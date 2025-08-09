@@ -477,13 +477,20 @@ def start(ctx):
         # window wraps past midnight
         return now.hour >= start_hour or now.hour < end_hour
 
+    last_set_current = None
+
     while True:
         date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
         print(date_str)
         readings = tesla.get_house_power()
         ev_status = bluelink.get_vehicle_status()
         charger_status = charger.get_status()
-        print(readings)
+        print({
+            "solar_power": readings["solar_power"],
+            "house_load": readings["house_load"],
+            "battery_soc": readings.get("battery_soc"),
+            "ev_soc": ev_status.get("soc"),
+        })
         print(charger_status)
 
         if ev_status["plugged_in"]:
@@ -547,6 +554,46 @@ def start(ctx):
                 state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
             elif in_grid_window and grid_amps:
                 state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
+            # --- Maintenance: reconcile EVSE amps even without a state transition ---
+
+            if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
+                # decide target amps for this state
+                desired_a = amps_wanted
+                if desired_a is None:
+                    # belt & suspenders fallback
+                    desired_a = engine.compute_amps(readings_eff)[0]
+
+                # current reading from EVSE
+                cur_a  = int(charger_status.get("current") or cfg.get("default_amps", 6))
+
+                # smoothing / quantization
+                step   = int(cfg.get("amp_step", 1))
+                ramp   = int(cfg.get("ramp_limit_amps", 6))
+                min_dA = int(cfg.get("min_delta_amps", 1))
+                max_a  = int(cfg.get("max_amps", 40))
+                min_a  = int(cfg.get("min_amps", 6))
+
+                desired_a = max(min_a, min(max_a, desired_a))
+                # quantize to step
+                desired_a = (desired_a // step) * step
+
+                # only act if changed meaningfully and not already what we set last time
+                if (abs(desired_a - cur_a) >= min_dA) and (desired_a != last_set_current):
+                    # ramp to avoid big jumps
+                    if desired_a > cur_a:
+                        desired_a = min(cur_a + ramp, desired_a)
+                    else:
+                        desired_a = max(cur_a - ramp, desired_a)
+
+                    charger.set_current(desired_a)
+                    last_set_current = desired_a
+                    last_cmd_ts = time.time()
+
+                # ensure charge session is running
+                if not ev_status.get("charging"):
+                    bluelink.start_charge()
+                    last_cmd_ts = time.time()
+
             else:
                 # normal solar headroom mode
                 readings_eff = dict(readings)

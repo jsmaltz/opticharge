@@ -237,8 +237,123 @@ class BlueLinkSensor:
                          for v in self.vm.vehicles.values()]
             raise RuntimeError(f"VIN '{vin}' not found; available VINs: {available}")
 
-    # --- add this method somewhere in the class ---
+def _call_with_reauth(self, func: callable):
+    """
+    Run func(), with 401/429 handling, transient payload retries,
+    and a circuit breaker that forces a full client re-init.
+    """
+    for attempt in range(3):
+        try:
+            return func()
+        except requests.exceptions.HTTPError as e:
+            code = getattr(e.response, "status_code", None)
+            if code == 401:
+                print("BlueLink 401 ? reauth?")
+                self.authenticate()
+                continue
+            if code == 429:
+                wait = 6 + attempt * 4
+                print(f"BlueLink 429 ? backoff {wait}s?")
+                time.sleep(wait)
+                continue
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
+            # SDK saw an unexpected/missing field; treat as transient
+            self._bluelink_fail_count += 1
+            print(f"BlueLink payload error ({type(e).__name__}): {e} "
+                  f"[fail#{self._bluelink_fail_count}]")
+
+            # short cooloff and try a normal reauth on first two hits
+            if self._bluelink_fail_count < 3:
+                time.sleep(2 + attempt)
+                try:
+                    self.authenticate()
+                except Exception:
+                    pass
+                continue
+
+            # circuit breaker: full client re-init on 3rd consecutive failure
+            self._full_reinit_bluelink()
+            # if we?re cooling off, don?t hammer
+            if time.time() < getattr(self, "_bluelink_cooloff_until", 0):
+                time.sleep(max(0, self._bluelink_cooloff_until - time.time()))
+            # after re-init, one more try this loop:
+            try:
+                return func()
+            finally:
+                # reset fail counter after a re-init path
+                self._bluelink_fail_count = 0
+        except Exception as e:
+            print(f"BlueLink unexpected error: {e!r}. Retrying once?")
+            time.sleep(2)
+            continue
+
+    # Final attempt (let exceptions bubble if it still fails)
+    return func()
+
     def _full_reinit_bluelink(self):
+        """Hard reset the BlueLink client stack and reselect vehicle."""
+        print("BlueLink: performing FULL client re-init")
+        try:
+            import requests
+            from hyundai_kia_connect_api.HyundaiBlueLinkApiUSA import HyundaiBlueLinkApiUSA
+            from hyundai_kia_connect_api.VehicleManager import VehicleManager
+
+            # brand-new HTTP session to drop stale cookies
+            fresh_session = requests.Session()
+            # If your API ctor accepts a session kwarg, pass it (many libs do)
+            try:
+                api = HyundaiBlueLinkApiUSA(session=fresh_session)
+            except TypeError:
+                # fallback if ctor doesn't accept session=
+                api = HyundaiBlueLinkApiUSA()
+
+            vm = VehicleManager(api)
+
+            # fresh login
+            token = api.login(self.username, self.password)
+            vm.set_token(token)
+
+            # rediscover vehicles
+            vehicles = vm.get_vehicles()
+            selected = None
+            if self.vin:
+                for v in vehicles:
+                    if getattr(v, "VIN", None) == self.vin:
+                        selected = v
+                        break
+                if not selected:
+                    raise RuntimeError(f"VIN {self.vin} not found after re-init")
+            else:
+                if not vehicles:
+                    raise RuntimeError("No vehicles returned after re-init")
+                selected = vehicles[0]
+
+            # bind IDs
+            self.vehicle_id = getattr(selected, "id", getattr(selected, "vehicle_id", None))
+
+            # NOW SWAP THEM IN ATOMICALLY
+            self.vm = vm
+            # Callers should always go through self.vm.api; but keep self.api aligned anyway
+            self.api = api
+
+            # clear counters
+            self._bluelink_fail_count = 0
+            self._bluelink_cooloff_until = 0
+            print("BlueLink: FULL re-init complete.")
+        except Exception as e:
+            print(f"BlueLink FULL re-init failed: {e!r}")
+            # avoid spin
+            self._bluelink_cooloff_until = time.time() + 60
+            raise
+
+        try:
+            _ = self.vm.get_vehicle(self.vehicle_id)
+        except Exception as e:
+            print(f"BlueLink: post-reinit sanity check failed: {e!r}")
+        raise
+
+    def _full_reinit_bluelink_rem(self):
         """Hard reset the BlueLink client stack and reselect our vehicle."""
         print("BlueLink: performing full client re-init")
         try:
@@ -301,21 +416,23 @@ class BlueLinkSensor:
                     continue
                 raise
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
-                # SDK saw an unexpected/missing field; treat as transient
                 self._bluelink_fail_count += 1
                 print(f"BlueLink payload error ({type(e).__name__}): {e} "
-                      f"[fail#{self._bluelink_fail_count}]")
-
-                # short cooloff and try a normal reauth on first two hits
-                if self._bluelink_fail_count < 3:
-                    time.sleep(2 + attempt)
-                    try:
-                        self.authenticate()
-                    except Exception:
-                        pass
+                      f"[fail#{self._bluelink_fail_count}/{self._refresh_fail_threshold}]")
+                if self._bluelink_fail_count >= self._refresh_fail_threshold:
+                    print("??  BlueLink circuit-breaker TRIPPED ? full re-init")
+                    self._full_reinit_bluelink()
+                    self._bluelink_fail_count = 0
                     continue
+                time.sleep(2)
+                try:
+                    self.authenticate()
+                except Exception:
+                    pass
+                continue
 
                 # circuit breaker: full client re-init on 3rd consecutive failure
+                print("??  BlueLink circuit-breaker TRIPPED ? full re-init")
                 self._full_reinit_bluelink()
                 # if we're cooling off, don't hammer
                 if time.time() < getattr(self, "_bluelink_cooloff_until", 0):

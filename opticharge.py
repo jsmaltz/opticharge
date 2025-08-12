@@ -759,10 +759,11 @@ def start(ctx):
 
                     if (headroom > hyst_w) and (batt_soc >= batt_full_thr):
                         # Soak up the actual surplus
-                        amps_wanted = _amps_for_surplus(headroom, cfg)
+                        amps_wanted, _ = engine.compute_amps(readings_eff)
                         state = "CHARGING_SOLAR"; reason = "solar surplus"
                     else:
                         state = "WAIT_SOLAR"; amps_wanted = None
+                        amps_wanted = None
                         if headroom <= hyst_w:
                             reason = "waiting for solar"
                         else:

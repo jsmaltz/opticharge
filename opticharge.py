@@ -748,21 +748,26 @@ def start(ctx):
                         last_cmd_ts = time.time()
 
                 else:
-                    # normal solar headroom mode
+                    # Use EVSE-excluded house load for all surplus math
                     readings_eff = dict(readings)
                     readings_eff["house_load"] = base_house
-                    amps_calc, do_charge = engine.compute_amps(readings_eff)
 
+                    # Explicitly require effective headroom > hysteresis AND PW threshold
                     batt_soc = readings.get("battery_soc", 0)
                     batt_full_thr = int(cfg.get("battery_soc_full_threshold", 99))
+                    hyst_w = int(getattr(engine, "hysteresis", cfg.get("hysteresis_watts", 500)))
 
-                    if do_charge and batt_soc >= batt_full_thr:
-                        state = "CHARGING_SOLAR"; amps_wanted = amps_calc; reason = "solar surplus"
-                    elif do_charge and batt_soc < batt_full_thr:
-                        state = "WAIT_SOLAR"; amps_wanted = None; reason = f"battery SOC {batt_soc:.1f}% < {batt_full_thr}%"
+                    if (headroom > hyst_w) and (batt_soc >= batt_full_thr):
+                        # Soak up the actual surplus
+                        amps_wanted = _amps_for_surplus(headroom, cfg)
+                        state = "CHARGING_SOLAR"; reason = "solar surplus"
                     else:
-                        state = "WAIT_SOLAR"; amps_wanted = None; reason = "waiting for solar"
-    
+                        state = "WAIT_SOLAR"; amps_wanted = None
+                        if headroom <= hyst_w:
+                            reason = "waiting for solar"
+                        else:
+                            reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
+
                 print(f"STATE={state} ({reason})")
 
                 # 4) Act only on transitions or after cooldown to avoid thrash

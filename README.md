@@ -8,12 +8,12 @@ back to grid.
 
 ## Features
 
-- 🔋 **Solar surplus charging** – match EVSE current to excess PV generation.
-- 🌙 **Off-peak grid charging** – automatically top-up during configured low-rate hours.
-- 🎯 **Target SOC control** – syncs Hyundai AC target SOC to your desired limits.
-- 💤 **Vehicle re-auth** – automatic BlueLink reauthentication and retry on failure.
-- ⚡ **Dynamic charging current ** – real-time adjustment to soak up surplus.
-- 🛑 **Anti-thrash** – cooldown timers for start/stop and current changes.
+- **Solar surplus charging** – match EVSE current to excess PV generation.
+- **Off-peak grid charging** – automatically top-up during configured low-rate hours.
+- **Target SOC control** – syncs Hyundai AC target SOC to your desired limits.
+- **Vehicle re-auth** – automatic BlueLink reauthentication and retry on failure.
+- **Dynamic charging current ** – real-time adjustment to soak up surplus.
+- **Anti-thrash** – cooldown timers for start/stop and current changes.
 
 ## Requirements
 

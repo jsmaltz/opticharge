@@ -752,11 +752,17 @@ def start(ctx):
                     readings_eff = dict(readings)
                     readings_eff["house_load"] = base_house
                     amps_calc, do_charge = engine.compute_amps(readings_eff)
-                    if do_charge:
+
+                    batt_soc = readings.get("battery_soc", 0)
+                    batt_full_thr = int(cfg.get("battery_soc_full_threshold", 99))
+
+                    if do_charge and batt_soc >= batt_full_thr:
                         state = "CHARGING_SOLAR"; amps_wanted = amps_calc; reason = "solar surplus"
+                    elif do_charge and batt_soc < batt_full_thr:
+                        state = "WAIT_SOLAR"; amps_wanted = None; reason = f"battery SOC {batt_soc:.1f}% < {batt_full_thr}%"
                     else:
                         state = "WAIT_SOLAR"; amps_wanted = None; reason = "waiting for solar"
-
+    
                 print(f"STATE={state} ({reason})")
 
                 # 4) Act only on transitions or after cooldown to avoid thrash

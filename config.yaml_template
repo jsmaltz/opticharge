@@ -36,6 +36,7 @@ grid_charge_fast_amps : 40
 # State-of-Charge thresholds
 ev_target_soc: 80            # % to hit before stopping
 ev_target_soc_solar_surplus: 100 # go higher instead of sending back to grid
+battery_soc_full_threshold: 99 # Powerwall level to allow surplus solar to go to EV
 
 # EV battery capacity
 ev_battery_capacity_kwh: 84.0

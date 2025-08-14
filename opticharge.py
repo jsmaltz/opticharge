@@ -27,49 +27,6 @@ from enum import Enum, auto
 class TransientAPIError(Exception):
     pass
 
-class ChargeState(Enum):
-    UNPLUGGED = auto()
-    TARGET_REACHED = auto()
-    WAIT_SOLAR = auto()
-    CHARGING_SOLAR = auto()
-    CHARGING_GRID = auto()
-    ERROR = auto()
-
-def classify_state(ev_status, charger_status, readings, cfg, target_soc):
-    if not ev_status.get("plugged_in"):
-        return ChargeState.UNPLUGGED, None, "car not plugged"
-    soc = ev_status.get("soc") or 0
-    if soc >= target_soc:
-        return ChargeState.TARGET_REACHED, None, "target met"
-    headroom = readings["solar_power"] - readings["house_load"]
-    batt_soc = readings.get("battery_soc", 0)
-
-    # solar case: only if headroom > hysteresis and PW ~full
-    if headroom > cfg.get("hysteresis_watts", 500) and batt_soc >= 99:
-        amps = DecisionEngine(cfg).compute_amps(readings)[0]
-        return ChargeState.CHARGING_SOLAR, amps, "solar surplus"
-
-    # grid window?
-    now = datetime.now()
-    if now.hour >= cfg["grid_charge_start_hour"] or now.hour < cfg["grid_charge_end_hour"]:
-        # choose rate
-        if cfg.get("grid_charge_fast", False):
-            amps = cfg["grid_charge_fast_amps"]
-        else:
-            # compute slow rate if capacity known, else fallback
-            if "ev_battery_capacity_kwh" in cfg:
-                hours_left_to_end = (
-                    (now.replace(hour=cfg["grid_charge_end_hour"], minute=0, second=0, microsecond=0)
-                     + (timedelta(days=1) if now.hour >= cfg["grid_charge_end_hour"] else timedelta()))
-                    - now
-                ).total_seconds()/3600
-                needed_kwh = max(0, (target_soc - soc) / 100 * cfg["ev_battery_capacity_kwh"])
-                amps = int(needed_kwh*1000 / (cfg["voltage"]*hours_left_to_end))
-                amps = max(cfg["min_amps"], min(cfg["max_amps"], amps))
-            else:
-                amps = cfg["max_amps"]
-        return ChargeState.CHARGING_GRID, amps, "grid window"
-    return ChargeState.WAIT_SOLAR, None, "waiting for solar"
 
 # ----- Sensors -----
 
@@ -353,7 +310,7 @@ class BlueLinkSensor:
                 self._bluelink_fail_count += 1
                 print(f"BlueLink payload error ({type(e).__name__}): {e} [fail#{self._bluelink_fail_count}]")
 
-                if self._bluelink_fail_count >= 3:
+                if self._bluelink_fail_count >= 1:
                     print("??  BlueLink circuit-breaker TRIPPED ? full re-init")
                     self._full_reinit_bluelink()
                     self._bluelink_fail_count = 0
@@ -415,7 +372,7 @@ class BlueLinkSensor:
                     self._refresh_fail_count += 1
                     print(f"refresh failed: {e}. fail#{self._refresh_fail_count}. Cooling off 30s.")
                     self._skip_next_refresh_until = now + 30
-                    if self._refresh_fail_count >= 3:
+                    if self._refresh_fail_count >= 1:
                         print("BlueLink refresh failures reached threshold ? full re-init")
                         self._full_reinit_bluelink()
                         self._refresh_fail_count = 0
@@ -657,7 +614,7 @@ def start(ctx):
                 batt_soc = readings.get("battery_soc", 0)
                 desired_target = cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
-                if headroom > engine.hysteresis and batt_soc >= 99:
+                if headroom > engine.hysteresis and batt_soc >= cfg['battery_soc_full_threshold']:
                     desired_target = surplus_target
 
                 # 2) Ensure AC target SOC matches desired_target (apply once per mismatch)
@@ -745,6 +702,7 @@ def start(ctx):
                     # ensure charge session is running
                     if not ev_status.get("charging"):
                         bluelink.start_charge()
+                        print("Starting charging")
                         last_cmd_ts = time.time()
 
                 else:
@@ -788,12 +746,14 @@ def start(ctx):
                         charger.set_current(amps_wanted)
                         if not ev_status.get("charging"):
                             bluelink.start_charge()
+                            print(f"Starting charging")
                         last_cmd_ts = now_ts
 
                     elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
                         if ev_status.get("charging"):
                             charger.set_current(cfg["default_amps"])
                             bluelink.stop_charge()
+                            print(f"Stopping charging")
                             last_cmd_ts = now_ts
 
                     # UNPLUGGED or anything else → no action

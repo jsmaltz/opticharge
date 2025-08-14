@@ -749,25 +749,29 @@ def start(ctx):
 
                 else:
                     # Use EVSE-excluded house load for all surplus math
-                    readings_eff = dict(readings)
-                    readings_eff["house_load"] = base_house
-
-                    # Explicitly require effective headroom > hysteresis AND PW threshold
+                    # Use PW SOC + effective headroom to allow solar charging
                     batt_soc = readings.get("battery_soc", 0)
                     batt_full_thr = int(cfg.get("battery_soc_full_threshold", 99))
-                    hyst_w = int(getattr(engine, "hysteresis", cfg.get("hysteresis_watts", 500)))
 
-                    if (headroom > hyst_w) and (batt_soc >= batt_full_thr):
-                        # Soak up the actual surplus
-                        amps_wanted, _ = engine.compute_amps(readings_eff)
+                    # effective headroom already computed earlier as:
+                    #   evse_w    = _evse_power_watts(charger_status, cfg)
+                    #   base_house = max(0.0, readings["house_load"] - evse_w)
+                    #   headroom   = readings["solar_power"] - base_house
+
+                    # still feed engine with EVSE-excluded house load (for any other internal calcs)
+                    readings_eff = dict(readings); readings_eff["house_load"] = base_house
+                    amps_calc, do_charge = engine.compute_amps(readings_eff)
+
+                    if (batt_soc >= batt_full_thr) and (headroom > getattr(engine, "hysteresis", 0)):
+                        # set amps to soak up the actual surplus
+                        amps_wanted = _amps_for_surplus(headroom, cfg)
                         state = "CHARGING_SOLAR"; reason = "solar surplus"
                     else:
                         state = "WAIT_SOLAR"; amps_wanted = None
-                        amps_wanted = None
-                        if headroom <= hyst_w:
-                            reason = "waiting for solar"
-                        else:
+                        if batt_soc < batt_full_thr:
                             reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
+                        else:
+                            reason = "waiting for solar"
 
                 print(f"STATE={state} ({reason})")
 

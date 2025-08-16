@@ -18,6 +18,7 @@ from hyundai_kia_connect_api import VehicleManager, const
 from datetime import datetime, timedelta
 from enum import Enum, auto
 
+import json
 # Turn on low-level HTTP debug logging
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
@@ -136,17 +137,18 @@ class TeslaSensor:
 class BlueLinkSensor:
     def __init__(
         self,
+        cfg,
         username: str,
         password: str,
         pin: str,
         region_cfg: int | str,
         brand_cfg: int | str,
-        vin: str
-    ):
+        vin: str):
+
         self._bluelink_fail_count = 0
         self._bluelink_cooloff_until = 0  # epoch seconds
         self._refresh_fail_count = 0
-        
+        self.cfg=cfg
         # normalize region and brand 
         regions = const.REGIONS
         if isinstance(region_cfg, int) and region_cfg in regions:
@@ -222,7 +224,7 @@ class BlueLinkSensor:
                       f"[fail#{self._bluelink_fail_count}]")
 
                 # short cooloff and try a normal reauth on first two hits
-                if self._bluelink_fail_count < 3:
+                if self._bluelink_fail_count < self.cfg['bluelink_refresh_fail_count']:
                     time.sleep(2 + attempt)
                     try:
                         self.authenticate()
@@ -372,7 +374,7 @@ class BlueLinkSensor:
                     self._refresh_fail_count += 1
                     print(f"refresh failed: {e}. fail#{self._refresh_fail_count}. Cooling off 30s.")
                     self._skip_next_refresh_until = now + 30
-                    if self._refresh_fail_count >= 1:
+                    if self._refresh_fail_count >= self.cfg['bluelink_refresh_fail_count']:
                         print("BlueLink refresh failures reached threshold ? full re-init")
                         self._full_reinit_bluelink()
                         self._refresh_fail_count = 0
@@ -530,6 +532,7 @@ def start(ctx):
     )
 
     bluelink = BlueLinkSensor(
+        cfg,
         username=cfg['bluelink_user'],
         password=cfg['bluelink_pass'],
         pin=cfg['bluelink_pin'],
@@ -614,7 +617,7 @@ def start(ctx):
                 batt_soc = readings.get("battery_soc", 0)
                 desired_target = cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
-                if headroom > engine.hysteresis and batt_soc >= cfg['battery_soc_full_threshold']:
+                if headroom > engine.hysteresis and batt_soc >= cfg['battery_soc_full_threshold_high']:
                     desired_target = surplus_target
 
                 # 2) Ensure AC target SOC matches desired_target (apply once per mismatch)
@@ -666,6 +669,11 @@ def start(ctx):
                     state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
                 # --- Maintenance: reconcile EVSE amps even without a state transition ---
 
+                # To avoid thrash, if the Powerwall has fallen past the low level, stop charging the EV
+                if state in ("CHARGING_SOLAR"):
+                    if readings.get("battery_soc") < cfg.get("battery_soc_full_threshold_low"):
+                        state = "SOLAR_WAIT"
+                    
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
                     # decide target amps for this state
                     desired_a = amps_wanted
@@ -709,7 +717,7 @@ def start(ctx):
                     # Use EVSE-excluded house load for all surplus math
                     # Use PW SOC + effective headroom to allow solar charging
                     batt_soc = readings.get("battery_soc", 0)
-                    batt_full_thr = int(cfg.get("battery_soc_full_threshold", 99))
+                    batt_full_thr = int(cfg.get("battery_soc_full_threshold_high", 99))
 
                     # effective headroom already computed earlier as:
                     #   evse_w    = _evse_power_watts(charger_status, cfg)
@@ -722,7 +730,7 @@ def start(ctx):
 
                     if (batt_soc >= batt_full_thr) and (headroom > getattr(engine, "hysteresis", 0)):
                         # set amps to soak up the actual surplus
-                        amps_wanted = _amps_for_surplus(headroom, cfg)
+                        amps_wanted = engine.compute_amps(readings)[0]
                         state = "CHARGING_SOLAR"; reason = "solar surplus"
                     else:
                         state = "WAIT_SOLAR"; amps_wanted = None

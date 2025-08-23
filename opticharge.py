@@ -25,8 +25,8 @@ import json
 #logging.getLogger("urllib3").setLevel(logging.DEBUG)
 
 
-class TransientAPIError(Exception):
-    pass
+#class TransientAPIError(Exception):
+#    pass
 
 
 # ----- Sensors -----

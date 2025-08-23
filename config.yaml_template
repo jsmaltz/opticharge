@@ -37,7 +37,7 @@ grid_charge_fast_amps : 40
 ev_target_soc: 80            # % to hit before stopping
 ev_target_soc_solar_surplus: 100 # go higher instead of sending back to grid
 bluelink_refresh_fail_count: 1
-battery_soc_full_threshold_low: 95 # Powerwall level to stop solar charging of ev
-battery_soc_full_threshold_high: 99 # Powerwall level to start solar charging of ev
+battery_soc_full_threshold_low: 50 # Powerwall level to stop solar charging of ev
+battery_soc_full_threshold_high: 55 # Powerwall level to start solar charging of ev
 # EV battery capacity
 ev_battery_capacity_kwh: 84.0

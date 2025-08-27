@@ -614,6 +614,7 @@ def start(ctx):
 
                 print({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
 
+                neg_headroom = headroom <= 0
                 batt_soc = readings.get("battery_soc", 0)
                 desired_target = cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
@@ -670,9 +671,9 @@ def start(ctx):
                 # --- Maintenance: reconcile EVSE amps even without a state transition ---
 
                 # To avoid thrash, if the Powerwall has fallen past the low level, stop charging the EV
-                if state in ("CHARGING_SOLAR"):
+                if state == "CHARGING_SOLAR":
                     if readings.get("battery_soc") < cfg.get("battery_soc_full_threshold_low"):
-                        state = "SOLAR_WAIT"
+                        state = "WAIT_SOLAR"
                     
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
                     # decide target amps for this state
@@ -719,25 +720,29 @@ def start(ctx):
                     batt_soc = readings.get("battery_soc", 0)
                     batt_full_thr = int(cfg.get("battery_soc_full_threshold_high", 99))
 
+                    
                     # effective headroom already computed earlier as:
                     #   evse_w    = _evse_power_watts(charger_status, cfg)
                     #   base_house = max(0.0, readings["house_load"] - evse_w)
                     #   headroom   = readings["solar_power"] - base_house
-
-                    # still feed engine with EVSE-excluded house load (for any other internal calcs)
-                    readings_eff = dict(readings); readings_eff["house_load"] = base_house
-                    amps_calc, do_charge = engine.compute_amps(readings_eff)
-
-                    if (batt_soc >= batt_full_thr) and (headroom > getattr(engine, "hysteresis", 0)):
-                        # set amps to soak up the actual surplus
-                        amps_wanted = engine.compute_amps(readings)[0]
-                        state = "CHARGING_SOLAR"; reason = "solar surplus"
-                    else:
+                    if neg_headroom and not in_grid_window:
                         state = "WAIT_SOLAR"; amps_wanted = None
-                        if batt_soc < batt_full_thr:
-                            reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
+                        reason = "negative headroom"
+                    else:
+                        # still feed engine with EVSE-excluded house load (for any other internal calcs)
+                        readings_eff = dict(readings); readings_eff["house_load"] = base_house
+                        amps_calc, do_charge = engine.compute_amps(readings_eff)
+
+                        if (batt_soc >= batt_full_thr) and (headroom > getattr(engine, "hysteresis", 0)):
+                            # set amps to soak up the actual surplus
+                            amps_wanted = engine.compute_amps(readings)[0]
+                            state = "CHARGING_SOLAR"; reason = "solar surplus"
                         else:
-                            reason = "waiting for solar"
+                            state = "WAIT_SOLAR"; amps_wanted = None
+                            if batt_soc < batt_full_thr:
+                                reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
+                            else:
+                                reason = "waiting for solar"
 
                 print(f"STATE={state} ({reason})")
 

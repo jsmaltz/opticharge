@@ -634,6 +634,10 @@ def start(ctx):
                 ev_charge_level = ev_status.get("soc") or 0
                 now = datetime.now()
                 in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
+                print({"now": now.strftime("%F %T"), 
+                       "grid_window": [cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"]], 
+                       "in_grid_window": in_grid_window})
+
                 target_reached = ev_charge_level >= desired_target
 
                 # decide amps for grid window if applicable
@@ -749,6 +753,10 @@ def start(ctx):
                 # 4) Act only on transitions or after cooldown to avoid thrash
                 now_ts = time.time()
                 should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and ev_status.get("charging") and not in_grid_window
+                # Safety: never keep CHARGING_GRID outside its window
+                if state == "CHARGING_GRID" and not in_grid_window:
+                    state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
+
                 should_act = (state != last_state) or ((now_ts - last_cmd_ts) > MIN_STARTSTOP_INTERVAL) or should_stop_now
 
                 if should_act:

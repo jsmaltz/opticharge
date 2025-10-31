@@ -596,6 +596,7 @@ def start(ctx):
             readings = tesla.get_house_power()
             ev_status = bluelink.get_vehicle_status()
             charger_status = charger.get_status()
+            state = None; amps_wanted = None; reason = ""
             print({
                 "solar_power": readings["solar_power"],
                 "house_load": readings["house_load"],
@@ -638,6 +639,9 @@ def start(ctx):
                        "grid_window": [cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"]], 
                        "in_grid_window": in_grid_window})
 
+                if headroom <= 0 and not in_grid_window:
+                    state = "WAIT_SOLAR"; amps_wanted = None; reason = "negative headroom (safety)"
+
                 target_reached = ev_charge_level >= desired_target
 
                 # decide amps for grid window if applicable
@@ -666,6 +670,7 @@ def start(ctx):
                             grid_amps = cfg["max_amps"]
 
                 # state resolution
+                
                 if not ev_status.get("plugged_in"):
                     state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
                 elif target_reached:

@@ -607,8 +607,21 @@ def start(ctx):
             })
             print(f"Charger status: {charger_status}")
 
-            if ev_status["plugged_in"]:
-                # 1) Determine desired target SOC (bump to surplus target on strong solar)
+
+            # --- start-of-tick reset to avoid sticky state/reason across iterations ---
+            state = None
+            amps_wanted = None
+            reason = ""
+            plugged_evse = bool(charger_status.get("connected"))
+            plugged_bl   = bool(ev_status.get("plugged_in"))
+            plugged      = plugged_evse or plugged_bl
+
+            charging_evse = bool(charger_status.get("charging"))
+            charging_bl   = bool(ev_status.get("charging"))
+            charging_actual = charging_evse
+
+            if plugged:
+# 1) Determine desired target SOC (bump to surplus target on strong solar)
                 evse_w = _evse_power_watts(charger_status, cfg)
                 base_house = max(0.0, readings["house_load"] - evse_w)  # house load excluding EVSE
                 headroom   = readings["solar_power"] - base_house
@@ -635,6 +648,10 @@ def start(ctx):
                 ev_charge_level = ev_status.get("soc") or 0
                 now = datetime.now()
                 in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
+
+                # Safety: no solar surplus outside grid window → force WAIT_SOLAR immediately
+                if headroom <= 0 and not in_grid_window:
+                    state = "WAIT_SOLAR"; amps_wanted = None; reason = "negative headroom (safety)"
                 print({"now": now.strftime("%F %T"), 
                        "grid_window": [cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"]], 
                        "in_grid_window": in_grid_window})
@@ -718,7 +735,7 @@ def start(ctx):
                         last_cmd_ts = time.time()
 
                     # ensure charge session is running
-                    if not ev_status.get("charging"):
+                    if not charging_actual:
                         bluelink.start_charge()
                         print("Starting charging")
                         last_cmd_ts = time.time()
@@ -751,13 +768,25 @@ def start(ctx):
                             if batt_soc < batt_full_thr:
                                 reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
                             else:
-                                reason = "waiting for solar"
+                                reason = "waiting for solar"                # Never keep CHARGING_GRID outside its window
+                if state == "CHARGING_GRID" and not in_grid_window:
+                    state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
+
+
 
                 print(f"STATE={state} ({reason})")
 
+                # Structured tick forensics
+                print({"now": now.strftime("%F %T"),
+                       "state": state,
+                       "reason": reason,
+                       "in_grid_window": in_grid_window,
+                       "plugged": plugged,
+                       "charging_evse": charging_evse,
+                       "charging_bl": charging_bl})
                 # 4) Act only on transitions or after cooldown to avoid thrash
                 now_ts = time.time()
-                should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and ev_status.get("charging") and not in_grid_window
+                should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and charging_actual and not in_grid_window
                 # Safety: never keep CHARGING_GRID outside its window
                 if state == "CHARGING_GRID" and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
@@ -770,7 +799,7 @@ def start(ctx):
                             # final belt & suspenders
                             amps_wanted = engine.compute_amps(readings)[0]
                         charger.set_current(amps_wanted)
-                        if not ev_status.get("charging"):
+                        if not charging_actual:
                             bluelink.start_charge()
                             print(f"Starting charging")
                         last_cmd_ts = now_ts

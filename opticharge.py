@@ -736,9 +736,12 @@ def start(ctx):
 
                     # ensure charge session is running
                     if not charging_actual:
-                        bluelink.start_charge()
-                        print("Starting charging")
-                        last_cmd_ts = time.time()
+                        if bool(ev_status.get("plugged_in")):   # require car-side plugged status
+                            bluelink.start_charge()
+                            print("Starting charging")
+                            last_cmd_ts = time.time()
+                        else:
+                            print("Skip start_charge: vehicle not plugged (BlueLink says unplugged)")
 
                 else:
                     # Use EVSE-excluded house load for all surplus math
@@ -800,9 +803,12 @@ def start(ctx):
                             amps_wanted = engine.compute_amps(readings)[0]
                         charger.set_current(amps_wanted)
                         if not charging_actual:
-                            bluelink.start_charge()
-                            print(f"Starting charging")
-                        last_cmd_ts = now_ts
+                            if bool(ev_status.get("plugged_in")):   # require car-side plugged status
+                                bluelink.start_charge()
+                                print("Starting charging")
+                                last_cmd_ts = time.time()
+                            else:
+                                print("Skip start_charge: vehicle not plugged (BlueLink says unplugged)")
 
                     elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
                         if ev_status.get("charging"):

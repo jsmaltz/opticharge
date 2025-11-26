@@ -607,14 +607,14 @@ def start(ctx):
             })
             print(f"Charger status: {charger_status}")
 
-
             # --- start-of-tick reset to avoid sticky state/reason across iterations ---
             state = None
             amps_wanted = None
             reason = ""
+            
             plugged_evse = bool(charger_status.get("connected"))
             plugged_bl   = bool(ev_status.get("plugged_in"))
-            plugged      = plugged_evse or plugged_bl
+            plugged      = plugged_evse   # EVSE pilot is the ground truth
 
             charging_evse = bool(charger_status.get("charging"))
             charging_bl   = bool(ev_status.get("charging"))
@@ -734,14 +734,27 @@ def start(ctx):
                         last_set_current = desired_a
                         last_cmd_ts = time.time()
 
-                    # ensure charge session is running
                     if not charging_actual:
-                        if bool(ev_status.get("plugged_in")):   # require car-side plugged status
+                        if plugged_evse:
+                            # Ensure AC target > current SOC so the car will actually start
+                            try:
+                                ev_soc = ev_status.get("soc") or 0
+                                ac_soc = bluelink.get_ac_target_soc()  # may be None on some payloads
+                            except Exception:
+                                ac_soc = None  # be permissive if read fails
+
+                            bump_target = max(desired_target or ev_soc, ev_soc + 1)
+                            if (ac_soc is None) or (ac_soc <= ev_soc):
+                                try:
+                                    bluelink.set_ac_target_soc(min(100, bump_target))
+                                except Exception as e:
+                                    print(f"set_ac_target_soc failed: {e}")
+
                             bluelink.start_charge()
                             print("Starting charging")
                             last_cmd_ts = time.time()
                         else:
-                            print("Skip start_charge: vehicle not plugged (BlueLink says unplugged)")
+                            print("Skip start_charge: EVSE not connected")
 
                 else:
                     # Use EVSE-excluded house load for all surplus math
@@ -781,12 +794,12 @@ def start(ctx):
 
                 # Structured tick forensics
                 print({"now": now.strftime("%F %T"),
-                       "state": state,
-                       "reason": reason,
+                       "state": state, "reason": reason,
                        "in_grid_window": in_grid_window,
-                       "plugged": plugged,
-                       "charging_evse": charging_evse,
-                       "charging_bl": charging_bl})
+                       "plugged_evse": plugged_evse, "plugged_bl": plugged_bl,
+                       "charging_evse": charging_evse, "charging_bl": charging_bl})
+
+
                 # 4) Act only on transitions or after cooldown to avoid thrash
                 now_ts = time.time()
                 should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and charging_actual and not in_grid_window
@@ -803,12 +816,27 @@ def start(ctx):
                             amps_wanted = engine.compute_amps(readings)[0]
                         charger.set_current(amps_wanted)
                         if not charging_actual:
-                            if bool(ev_status.get("plugged_in")):   # require car-side plugged status
-                                bluelink.start_charge()
-                                print("Starting charging")
-                                last_cmd_ts = time.time()
-                            else:
-                                print("Skip start_charge: vehicle not plugged (BlueLink says unplugged)")
+                            if plugged_evse:
+                                # Ensure AC target > current SOC so the car will actually start
+                                try:
+                                    ev_soc = ev_status.get("soc") or 0
+                                    ac_soc = bluelink.get_ac_target_soc()  # may be None on some payloads
+                                except Exception:
+                                    ac_soc = None  # be permissive if read fails
+
+                                bump_target = max(desired_target or ev_soc, ev_soc + 1)
+                                if (ac_soc is None) or (ac_soc <= ev_soc):
+                                    try:
+                                        bluelink.set_ac_target_soc(min(100, bump_target))
+                                    except Exception as e:
+                                        print(f"set_ac_target_soc failed: {e}")
+
+                                    bluelink.start_charge()
+                                    print("Starting charging")
+                                    last_cmd_ts = time.time()
+                                else:
+                                    print("Skip start_charge: EVSE not connected")
+
 
                     elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
                         if ev_status.get("charging"):

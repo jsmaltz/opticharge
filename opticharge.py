@@ -24,7 +24,6 @@ import json
 #logging.basicConfig(level=logging.DEBUG)
 #logging.getLogger("urllib3").setLevel(logging.DEBUG)
 
-
 #class TransientAPIError(Exception):
 #    pass
 
@@ -108,7 +107,7 @@ class TeslaSensor:
             r = self.session.get(live_url, headers=headers)
         r.raise_for_status()
         live = r.json()["response"]
-        #print(live)
+        #click.echo(live)
         #breakpoint()
         solar = live.get("solar_power", 0)
         #solar = 4000
@@ -208,19 +207,19 @@ class BlueLinkSensor:
             except requests.exceptions.HTTPError as e:
                 code = getattr(e.response, "status_code", None)
                 if code == 401:
-                    print("BlueLink 401 ? reauth?")
+                    click.echo("BlueLink 401 ? reauth?")
                     self.authenticate()
                     continue
                 if code == 429:
                     wait = 6 + attempt * 4
-                    print(f"BlueLink 429 ? backoff {wait}s?")
+                    click.echo(f"BlueLink 429 ? backoff {wait}s?")
                     time.sleep(wait)
                     continue
                 raise
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
                 # SDK saw an unexpected/missing field; treat as transient
                 self._bluelink_fail_count += 1
-                print(f"BlueLink payload error ({type(e).__name__}): {e} "
+                click.echo(f"BlueLink payload error ({type(e).__name__}): {e} "
                       f"[fail#{self._bluelink_fail_count}]")
 
                 # short cooloff and try a normal reauth on first two hits
@@ -244,7 +243,7 @@ class BlueLinkSensor:
                     # reset fail counter after a re-init path
                     self._bluelink_fail_count = 0
             except Exception as e:
-                print(f"BlueLink unexpected error: {e!r}. Retrying once?")
+                click.echo(f"BlueLink unexpected error: {e!r}. Retrying once?")
                 time.sleep(2)
                 continue
 
@@ -253,7 +252,7 @@ class BlueLinkSensor:
 
     def _full_reinit_bluelink(self):
         """Hard reset BlueLink by rebuilding VehicleManager exactly like authenticate()."""
-        print("BlueLink: performing FULL client re-init?")
+        click.echo("BlueLink: performing FULL client re-init?")
         from hyundai_kia_connect_api import VehicleManager
 
         # Recreate VehicleManager exactly as in authenticate()
@@ -286,7 +285,7 @@ class BlueLinkSensor:
         self._bluelink_cooloff_until = 0
         setattr(self, "_skip_next_refresh_until", 0)
 
-        print("BlueLink: FULL re-init complete.")
+        click.echo("BlueLink: FULL re-init complete.")
 
     def _call_with_reauth(self, func: callable):
         """
@@ -299,21 +298,21 @@ class BlueLinkSensor:
             except requests.exceptions.HTTPError as e:
                 code = getattr(e.response, "status_code", None)
                 if code == 401:
-                    print("BlueLink 401 ? reauth?")
+                    click.echo("BlueLink 401 ? reauth?")
                     self.authenticate()
                     continue
                 if code == 429:
                     wait = 6 + attempt * 4
-                    print(f"BlueLink 429 ? backoff {wait}s?")
+                    click.echo(f"BlueLink 429 ? backoff {wait}s?")
                     time.sleep(wait)
                     continue
                 raise
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
                 self._bluelink_fail_count += 1
-                print(f"BlueLink payload error ({type(e).__name__}): {e} [fail#{self._bluelink_fail_count}]")
+                click.echo(f"BlueLink payload error ({type(e).__name__}): {e} [fail#{self._bluelink_fail_count}]")
 
                 if self._bluelink_fail_count >= 1:
-                    print("??  BlueLink circuit-breaker TRIPPED ? full re-init")
+                    click.echo("??  BlueLink circuit-breaker TRIPPED ? full re-init")
                     self._full_reinit_bluelink()
                     self._bluelink_fail_count = 0
                     continue
@@ -326,7 +325,7 @@ class BlueLinkSensor:
                 continue
 
                 # circuit breaker: full client re-init on 3rd consecutive failure
-                print("??  BlueLink circuit-breaker TRIPPED ? full re-init")
+                click.echo("??  BlueLink circuit-breaker TRIPPED ? full re-init")
                 self._full_reinit_bluelink()
                 # if we're cooling off, don't hammer
                 if time.time() < getattr(self, "_bluelink_cooloff_until", 0):
@@ -338,7 +337,7 @@ class BlueLinkSensor:
                     # reset fail counter after a re-init path
                     self._bluelink_fail_count = 0
             except Exception as e:
-                print(f"BlueLink unexpected error: {e!r}. Retrying once?")
+                click.echo(f"BlueLink unexpected error: {e!r}. Retrying once?")
                 time.sleep(2)
                 continue
 
@@ -372,10 +371,10 @@ class BlueLinkSensor:
                     self._refresh_fail_count = 0
                 except Exception as e:
                     self._refresh_fail_count += 1
-                    print(f"refresh failed: {e}. fail#{self._refresh_fail_count}. Cooling off 30s.")
+                    click.echo(f"refresh failed: {e}. fail#{self._refresh_fail_count}. Cooling off 30s.")
                     self._skip_next_refresh_until = now + 30
                     if self._refresh_fail_count >= self.cfg['bluelink_refresh_fail_count']:
-                        print("BlueLink refresh failures reached threshold ? full re-init")
+                        click.echo("BlueLink refresh failures reached threshold ? full re-init")
                         self._full_reinit_bluelink()
                         self._refresh_fail_count = 0
                         self.vm.update_vehicle_with_cached_state(self.vehicle_id)
@@ -452,7 +451,7 @@ class WallboxCharger:
         self.client.authenticate()
         # print the chargers we see
         ids = self.client.getChargersList()
-        print("DEBUG: Available charger IDs:", ids)
+        click.echo("DEBUG: Available charger IDs:", ids)
         self.charger_id = ids[0]
 
     def _call_with_reauth(self, func, *args, **kwargs):
@@ -460,11 +459,11 @@ class WallboxCharger:
             return func(*args, **kwargs)
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 401:
-                print("Wallbox session expired. Re-authenticating...")
+                click.echo("Wallbox session expired. Re-authenticating...")
                 self.client.authenticate()
                 return func(*args, **kwargs)
             elif e.response.status_code == 429:
-                print("Wallbox rate limit hit (429). Sleeping and retrying once...")
+                click.echo("Wallbox rate limit hit (429). Sleeping and retrying once...")
                 time.sleep(10)  # backoff to avoid hammering
                 return func(*args, **kwargs)
             else:
@@ -477,7 +476,7 @@ class WallboxCharger:
         # This will send the HTTP request to change the current
         result = self._call_with_reauth(self.client.setMaxChargingCurrent, self.charger_id, amps)
 
-        #print(f"DEBUG: setMaxChargingCurrent returned: {result}")
+        #click.echo(f"DEBUG: setMaxChargingCurrent returned: {result}")
         return result
     
     def get_status(self) -> dict:
@@ -541,10 +540,10 @@ def start(ctx):
         vin=cfg['vehicle_vin']
     )
 
-#    print("BL obj:", bluelink.__class__.__name__, "from", getattr(bluelink.__class__, "__module__", "?"))
-#    print("Has get_vehicle_status?", hasattr(bluelink, "get_vehicle_status"))
+#    click.echo("BL obj:", bluelink.__class__.__name__, "from", getattr(bluelink.__class__, "__module__", "?"))
+#    click.echo("Has get_vehicle_status?", hasattr(bluelink, "get_vehicle_status"))
 #    if not hasattr(bluelink, "get_vehicle_status"):
-#        print("Methods:", [m for m in dir(bluelink) if m.startswith("get_") or m.startswith("Get_")])
+#        click.echo("Methods:", [m for m in dir(bluelink) if m.startswith("get_") or m.startswith("Get_")])
         
     charger = WallboxCharger(
         username=cfg['wallbox_user'],
@@ -592,7 +591,7 @@ def start(ctx):
     while True:
         try:
             date_str = datetime.now().strftime("%Y%m%d-%H%M%S")
-            print(date_str)
+            click.echo(date_str)
             readings = tesla.get_house_power()
             ev_status = bluelink.get_vehicle_status()
             charger_status = charger.get_status()
@@ -605,7 +604,7 @@ def start(ctx):
                 "ev_charging": ev_status.get("charging"),
                 "ev_charging_power_kW": ev_status.get("charging_power_kW")
             })
-            print(f"Charger status: {charger_status}")
+            click.echo(f"Charger status: {charger_status}")
 
             # --- start-of-tick reset to avoid sticky state/reason across iterations ---
             state = None
@@ -626,7 +625,7 @@ def start(ctx):
                 base_house = max(0.0, readings["house_load"] - evse_w)  # house load excluding EVSE
                 headroom   = readings["solar_power"] - base_house
 
-                print({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
+                click.echo({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
 
                 neg_headroom = headroom <= 0
                 batt_soc = readings.get("battery_soc", 0)
@@ -652,7 +651,7 @@ def start(ctx):
                 # Safety: no solar surplus outside grid window → force WAIT_SOLAR immediately
                 if headroom <= 0 and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "negative headroom (safety)"
-                print({"now": now.strftime("%F %T"), 
+                click.echo({"now": now.strftime("%F %T"), 
                        "grid_window": [cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"]], 
                        "in_grid_window": in_grid_window})
 
@@ -748,13 +747,13 @@ def start(ctx):
                                 try:
                                     bluelink.set_ac_target_soc(min(100, bump_target))
                                 except Exception as e:
-                                    print(f"set_ac_target_soc failed: {e}")
+                                    click.echo(f"set_ac_target_soc failed: {e}")
 
                             bluelink.start_charge()
-                            print("Starting charging")
+                            click.echo("Starting charging")
                             last_cmd_ts = time.time()
                         else:
-                            print("Skip start_charge: EVSE not connected")
+                            click.echo("Skip start_charge: EVSE not connected")
 
                 else:
                     # Use EVSE-excluded house load for all surplus math
@@ -790,10 +789,10 @@ def start(ctx):
 
 
 
-                print(f"STATE={state} ({reason})")
+                click.echo(f"STATE={state} ({reason})")
 
                 # Structured tick forensics
-                print({"now": now.strftime("%F %T"),
+                click.echo({"now": now.strftime("%F %T"),
                        "state": state, "reason": reason,
                        "in_grid_window": in_grid_window,
                        "plugged_evse": plugged_evse, "plugged_bl": plugged_bl,
@@ -829,20 +828,20 @@ def start(ctx):
                                     try:
                                         bluelink.set_ac_target_soc(min(100, bump_target))
                                     except Exception as e:
-                                        print(f"set_ac_target_soc failed: {e}")
+                                        click.echo(f"set_ac_target_soc failed: {e}")
 
                                     bluelink.start_charge()
-                                    print("Starting charging")
+                                    click.echo("Starting charging")
                                     last_cmd_ts = time.time()
                                 else:
-                                    print("Skip start_charge: EVSE not connected")
+                                    click.echo("Skip start_charge: EVSE not connected")
 
 
                     elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
                         if ev_status.get("charging"):
                             charger.set_current(cfg["default_amps"])
                             bluelink.stop_charge()
-                            print(f"Stopping charging")
+                            click.echo(f"Stopping charging")
                             last_cmd_ts = now_ts
 
                     # UNPLUGGED or anything else → no action
@@ -853,12 +852,12 @@ def start(ctx):
             consec_errors = 0
 
         except KeyboardInterrupt:
-            print("Exiting on Ctrl+C"); break
+            click.echo("Exiting on Ctrl+C"); break
                 
         except Exception as e:
             consec_errors += 1
             backoff = min(2 * consec_errors, max_backoff)
-            print(f"Tick error ({type(e).__name__}): {e}. Backing off {backoff}s, then continuing.")
+            click.echo(f"Tick error ({type(e).__name__}): {e}. Backing off {backoff}s, then continuing.")
             time.sleep(backoff)
             
         # normal sleep to next tick (your poll_interval + jitter)

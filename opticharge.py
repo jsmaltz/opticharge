@@ -448,46 +448,84 @@ class BlueLinkSensor:
 class WallboxCharger:
     def __init__(self, username: str, password: str):
         self.client = Wallbox(username, password)
-        self.client.authenticate()
-        # print the chargers we see
-        ids = self.client.getChargersList()
-        click.echo("DEBUG: Available charger IDs:", ids)
-        self.charger_id = ids[0]
+        self.charger_id = None  # defer until we can reliably fetch
+        # Try once, but never crash if Wallbox isn't ready yet
+        try:
+            self.client.authenticate()
+            ids = self.client.getChargersList()
+            if ids:
+                self.charger_id = ids[0]
+                click.echo(f"DEBUG: Available charger IDs: {ids}")
+            else:
+                click.echo("WARNING: No Wallbox chargers visible yet; will retry on first use.")
+        except Exception as e:
+            # Defer to first use; _ensure_session() will retry with backoff
+            click.echo(f"Wallbox init: deferring auth/list due to temporary error: {e!r}")
+
+    def _ensure_session(self):
+        """
+        Ensure we are authenticated and have a charger_id.
+        Called lazily by public methods so init failures don't kill the process.
+        """
+        # Authenticate if token missing/expired
+        try:
+            # authenticate() is idempotent in wallbox lib; call once here
+            self.client.authenticate()
+        except Exception as e:
+            # One short backoff + retry to ride out transient startup/network issues
+            click.echo(f"Wallbox auth failed, retrying shortly: {e!r}")
+            time.sleep(3)
+            self.client.authenticate()
+
+        # Ensure we have a charger id
+        if not self.charger_id:
+            ids = self.client.getChargersList()
+            if not ids:
+                raise RuntimeError("No Wallbox chargers available after auth retry")
+            self.charger_id = ids[0]
+            click.echo(f"DEBUG: Available charger IDs: {ids}")
 
     def _call_with_reauth(self, func, *args, **kwargs):
+        """
+        Wrap a Wallbox API call with lightweight 401/429/connection retry.
+        """
         try:
             return func(*args, **kwargs)
         except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 401:
-                click.echo("Wallbox session expired. Re-authenticating...")
-                self.client.authenticate()
+            status = getattr(e.response, "status_code", None)
+            if status in (401, 403):
+                click.echo("Wallbox session unauthorized. Re-authenticating...")
+                self._ensure_session()
                 return func(*args, **kwargs)
-            elif e.response.status_code == 429:
-                click.echo("Wallbox rate limit hit (429). Sleeping and retrying once...")
-                time.sleep(10)  # backoff to avoid hammering
+            if status == 429:
+                click.echo("Wallbox rate limit (429). Backing off 10s and retrying?")
+                time.sleep(10)
                 return func(*args, **kwargs)
-            else:
-                raise
+            raise
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as e:
+            click.echo(f"Wallbox network error: {e!r}. Backing off 3s and retrying?")
+            time.sleep(3)
+            self._ensure_session()
+            return func(*args, **kwargs)
 
     def set_current(self, amps: int):
         """
         Set the maximum charging current (in amps) on the Pulsar Plus.
         """
-        # This will send the HTTP request to change the current
-        result = self._call_with_reauth(self.client.setMaxChargingCurrent, self.charger_id, amps)
+        self._ensure_session()
+        return self._call_with_reauth(self.client.setMaxChargingCurrent, self.charger_id, amps)
 
-        #click.echo(f"DEBUG: setMaxChargingCurrent returned: {result}")
-        return result
-    
     def get_status(self) -> dict:
+        self._ensure_session()
         raw_status = self._call_with_reauth(self.client.getChargerStatus, self.charger_id)
         cfg = raw_status.get('config_data', {})
         current = cfg.get('max_charging_current')
         sid     = raw_status.get('status_id')
 
-        connected     = sid not in {0, 163}
+        connected      = sid not in {0, 163}
         charging_codes = {193, 194, 195}
-        charging      = sid in charging_codes
+        charging       = sid in charging_codes
 
         return {
             'current':   current,

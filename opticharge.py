@@ -597,7 +597,7 @@ def start(ctx):
             ev_status = bluelink.get_vehicle_status()
             charger_status = charger.get_status()
             state = None; amps_wanted = None; reason = ""
-            print({
+            click.echo({
                 "solar_power": readings["solar_power"],
                 "house_load": readings["house_load"],
                 "battery_soc": readings.get("battery_soc"),

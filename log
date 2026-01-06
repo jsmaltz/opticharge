@@ -1,0 +1,3 @@
+   journalctl -u opticharge.service -f
+
+ service opticharge.service start 

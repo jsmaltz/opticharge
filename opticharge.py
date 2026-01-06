@@ -194,6 +194,7 @@ class TeslaSensor:
         }
 
 class BlueLinkSensor:
+    
     def __init__(
         self,
         cfg,
@@ -232,7 +233,7 @@ class BlueLinkSensor:
         self.vin = vin
 
         self.authenticate()
-
+    
     def _safe_vehicle_data(self, vehicle) -> dict:
         """
         Return vehicle.data as a dict. If it's a JSON string or anything else,
@@ -519,6 +520,14 @@ class BlueLinkSensor:
         return self._call_with_reauth(_do)
 
 class WallboxCharger:
+
+    EVSE_STATUS_PLUGGED = {
+        164, 165, 177, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189,
+        193, 194, 195, 196, 209, 210
+    }
+    EVSE_STATUS_NOT_PLUGGED = {0, 161, 162, 163}
+
+
     def __init__(self, username: str, password: str):
         self.client = Wallbox(username, password)
         self.charger_id = None  # defer until we can reliably fetch
@@ -534,6 +543,14 @@ class WallboxCharger:
         except Exception as e:
             # Defer to first use; _ensure_session() will retry with backoff
             click.echo(f"Wallbox init: deferring auth/list due to temporary error: {e!r}")
+
+    def _is_evse_plugged(self, status_id: int) -> bool:
+        if status_id in self.EVSE_STATUS_NOT_PLUGGED:
+            return False
+        if status_id in self.EVSE_STATUS_PLUGGED:
+            return True
+        # Unknown/new code: be conservative (treat as NOT plugged)
+        return False
 
     def _ensure_session(self):
         """
@@ -746,7 +763,10 @@ def start(ctx):
             amps_wanted = None
             reason = ""
             
-            plugged_evse = bool(charger_status.get("connected"))
+            #plugged_evse = bool(charger_status.get("connected"))
+
+            breakpoint()
+            plugged_evse = charger._is_evse_plugged(charger_status.get("status_id"))
             plugged_bl   = bool(ev_status.get("plugged_in"))
             plugged      = plugged_evse   # EVSE pilot is the ground truth
 

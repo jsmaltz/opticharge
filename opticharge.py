@@ -529,12 +529,14 @@ class WallboxCharger:
 
 
     def __init__(self, username: str, password: str):
+        self._rate_limit_until = 0  # UNIX ts until which we should not call Wallbox again
         self.client = Wallbox(username, password)
         self.charger_id = None  # defer until we can reliably fetch
         # Try once, but never crash if Wallbox isn't ready yet
         try:
             self.client.authenticate()
-            ids = self.client.getChargersList()
+            ids = self._call_with_reauth(self.client.getChargersList)
+#            ids = self.client.getChargersList()
             if ids:
                 self.charger_id = ids[0]
                 click.echo(f"DEBUG: Available charger IDs: {ids}")
@@ -576,6 +578,54 @@ class WallboxCharger:
             click.echo(f"DEBUG: Available charger IDs: {ids}")
 
     def _call_with_reauth(self, func, *args, **kwargs):
+        import time
+        try:
+            # Respect any active rate-limit holdoff
+            now = time.time()
+            if getattr(self, "_rate_limit_until", 0) > now:
+                sleep_for = int(self._rate_limit_until - now)
+                if sleep_for > 0:
+                    click.echo(f"Wallbox rate limit holdoff: sleeping {sleep_for}s before calling {getattr(func, '__name__', 'call')}")
+                    time.sleep(sleep_for)
+            return func(*args, **kwargs)
+
+        except requests.exceptions.HTTPError as e:
+            status = getattr(e.response, "status_code", None)
+            if status in (401, 403):
+                click.echo("Wallbox session unauthorized. Re-authenticating...")
+                # Re-auth then retry once
+                self.client.authenticate()
+                return func(*args, **kwargs)
+
+            if status == 429:
+                # Back off hard and set a holdoff window for subsequent ticks
+                backoff = 15
+                click.echo(f"Wallbox rate limit (429). Backing off {backoff}s and retrying once.")
+                time.sleep(backoff)
+                # Retry once after backoff
+                try:
+                    result = func(*args, **kwargs)
+                except requests.exceptions.HTTPError as e2:
+                    # If still 429, extend holdoff and re-raise to outer loop
+                    if getattr(e2.response, "status_code", None) == 429:
+                        self._rate_limit_until = time.time() + 60  # 1 minute holdoff
+                        click.echo("Wallbox 429 persists. Setting 60s holdoff for subsequent calls.")
+                    raise
+                else:
+                    # Success after backoff?clear holdoff window
+                    self._rate_limit_until = 0
+                    return result
+
+            # Not a handled code: bubble up
+            raise
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            click.echo(f"Wallbox network error: {e!r}. Backing off 3s and retrying?")
+            time.sleep(3)
+            # One retry after a short network backoff
+            return func(*args, **kwargs)
+
+    def _call_with_reauth_rem(self, func, *args, **kwargs):
         """
         Wrap a Wallbox API call with lightweight 401/429/connection retry.
         """
@@ -764,8 +814,6 @@ def start(ctx):
             reason = ""
             
             #plugged_evse = bool(charger_status.get("connected"))
-
-            breakpoint()
             plugged_evse = charger._is_evse_plugged(charger_status.get("status_id"))
             plugged_bl   = bool(ev_status.get("plugged_in"))
             plugged      = plugged_evse   # EVSE pilot is the ground truth

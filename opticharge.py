@@ -60,7 +60,14 @@ class TeslaSensor:
             "refresh_token": self.refresh_token,
             "audience":      self.audience
         }
-        r = self.session.post(self.token_url, data=payload)
+        try:
+            r = self.session.post(self.token_url, data=payload)
+        except requests.RequestException as e:
+            print(f"TESLA token POST error: {e!r}")
+            raise
+        if r.status_code != 200:
+            print(f"TESLA token status={r.status_code} body={r.text[:200]!r}")
+
         r.raise_for_status()
         j = r.json()
         self.access_token  = j["access_token"]
@@ -71,7 +78,14 @@ class TeslaSensor:
         if self._products_json is None:
             headers = {"Authorization": f"Bearer {self.access_token}"}
             url = f"{self.owner_api_url}/api/1/products"
-            r = self.session.get(url, headers=headers)
+            try:
+                r = self.session.get(url, headers=headers)
+            except requests.RequestException as e:
+                print(f"TESLA products GET error: {e!r}")
+                raise
+            if r.status_code != 200:
+                print(f"TESLA products status={r.status_code} body={r.text[:200]!r}")
+
             r.raise_for_status()
             self._products_json = r.json()["response"]
         return self._products_json
@@ -86,7 +100,10 @@ class TeslaSensor:
             elif isinstance(resp, list) and "energy_site_id" in resp[0]:
                 self._site_id = resp[0]["energy_site_id"]
             else:
-                raise RuntimeError(f"Could not find energy_site_id in {resp!r}")
+                print(f"TESLA products unexpected shape: {type(resp).__name__} → {str(resp)[:200]!r}")
+                raise RuntimeError(f"Could not find energy_site_id in products payload")
+            print(f"TESLA site_id resolved: {self._site_id}")
+
         return self._site_id
 
     def get_house_power(self) -> dict:
@@ -99,14 +116,31 @@ class TeslaSensor:
 
         # 2) live_status → solar & load (and maybe battery_level)
         live_url = f"{self.owner_api_url}/api/1/energy_sites/{site_id}/live_status"
-        r = self.session.get(live_url, headers=headers)
+        try:
+            r = self.session.get(live_url, headers=headers)
+        except requests.RequestException as e:
+            print(f"TESLA live_status GET error: {e!r}")
+            raise
         if r.status_code == 401:
             # expired token? retry once
             self._refresh_access_token()
             headers["Authorization"] = f"Bearer {self.access_token}"
+            print("TESLA live_status retry after token refresh…")
             r = self.session.get(live_url, headers=headers)
+        if r.status_code != 200:
+            print(f"TESLA live_status status={r.status_code} body={r.text[:200]!r}")
+            
         r.raise_for_status()
-        live = r.json()["response"]
+        try:
+            body = r.json()
+        except json.JSONDecodeError as e:
+            print(f"TESLA live_status JSON decode error: {e!r} body={r.text[:200]!r}")
+            raise
+        if not isinstance(body, dict) or "response" not in body:
+            print(f"TESLA live_status unexpected payload: type={type(body).__name__} preview={str(body)[:200]!r}")
+            live = {}
+        else:
+            live = body["response"]
         
         if isinstance(live, str):
             try:
@@ -116,39 +150,48 @@ class TeslaSensor:
                 live = {}
         if not isinstance(live, dict):
             live = {}
-            
-        #click.echo(live)
-        #breakpoint()
 
+                    # ---- DIAGNOSTIC: show the live payload shape
+        try:
+            print(f"TESLA live_status keys: {sorted(list(live.keys()))}")
+        except Exception:
+            pass
+
+        # ---- Owner API standard keys
         def _num(x, default=0.0):
             try:
                 return float(x) if x is not None else default
             except Exception:
                 return default
 
-        # Then use:
         solar = _num(live.get("solar_power"), 0.0)
-        house = _num(live.get("house_load"), 0.0)
-        batt  = _num(live.get("battery_soc"), 0.0)
+        house = _num(live.get("load_power"), 0.0)
+        batt = _num(live.get("percentage_charged"))
 
-        # 3) battery_level fall-back if needed
-        if batt is None:
-            # try site_info
+        # Fallback ONLY if SOC missing or zero (some tenants report 0 here)
+        if not batt:
             info_url = f"{self.owner_api_url}/api/1/energy_sites/{site_id}/site_info"
             r2 = self.session.get(info_url, headers=headers)
+            if r2.status_code != 200:
+                print(f"TESLA site_info status={r2.status_code} body={r2.text[:200]!r}")
             r2.raise_for_status()
-            info = r2.json()["response"]
-            batt = (
+            info_body = r2.json()
+            info = info_body.get("response", info_body) if isinstance(info_body, dict) else {}
+            batt = _num(
                 info.get("battery", {}).get("percent")
                 or info.get("battery_level")
-                or info.get("percentage_charged")
+                or info.get("percentage_charged"),
+                0.0
             )
+
+        # One concise line to verify actual numbers we’re using
+        print(f"TESLA parsed: solar={solar:.1f}W, load={house:.1f}W, batt={batt:.1f}%")
+
         return {
             "solar_power": solar,
-            "house_load" : house,
+            "house_load":  house,
             "battery_soc": batt,
         }
-
 
 class BlueLinkSensor:
     def __init__(

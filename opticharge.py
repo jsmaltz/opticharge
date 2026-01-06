@@ -107,12 +107,29 @@ class TeslaSensor:
             r = self.session.get(live_url, headers=headers)
         r.raise_for_status()
         live = r.json()["response"]
+        
+        if isinstance(live, str):
+            try:
+                live = json.loads(live)
+                print("NOTE: Tesla live payload was JSON string; parsed to dict.")
+            except Exception:
+                live = {}
+        if not isinstance(live, dict):
+            live = {}
+            
         #click.echo(live)
         #breakpoint()
-        solar = live.get("solar_power", 0)
-        #solar = 4000
-        load  = live.get("load_power", 0)
-        batt  = live.get("percentage_charged", None)
+
+        def _num(x, default=0.0):
+            try:
+                return float(x) if x is not None else default
+            except Exception:
+                return default
+
+        # Then use:
+        solar = _num(live.get("solar_power"), 0.0)
+        house = _num(live.get("house_load"), 0.0)
+        batt  = _num(live.get("battery_soc"), 0.0)
 
         # 3) battery_level fall-back if needed
         if batt is None:
@@ -128,7 +145,7 @@ class TeslaSensor:
             )
         return {
             "solar_power": solar,
-            "house_load" : load,
+            "house_load" : house,
             "battery_soc": batt,
         }
 
@@ -172,6 +189,21 @@ class BlueLinkSensor:
         self.vin = vin
 
         self.authenticate()
+
+    def _safe_vehicle_data(self, vehicle) -> dict:
+        """
+        Return vehicle.data as a dict. If it's a JSON string or anything else,
+        parse or fall back to {} so .get(...) is always safe.
+        """
+        d = getattr(vehicle, "data", None)
+        if isinstance(d, str):
+            try:
+                d = json.loads(d)
+            except Exception:
+                d = {}
+        if not isinstance(d, dict):
+            d = {}
+        return d
 
     def authenticate(self):
         self.vm = VehicleManager(
@@ -384,19 +416,15 @@ class BlueLinkSensor:
             target_ac = getattr(car, "ev_charge_limits_ac", None)
             target_dc = getattr(car, "ev_charge_limits_dc", None)
             charging_power_kW = getattr(car, "ev_charging_power", None)
-            
-            # try per-plug list if present
-            try:
-                rci = (car.data or {}).get("vehicleStatus", {}).get("evStatus", {}).get("reservChargeInfos", {}) or {}
-                tslist = rci.get("targetSOClist", []) or []
-                for item in tslist:
-                    if item.get("plugType") == 0:
-                        target_ac = item.get("targetSOClevel", target_ac)
-                    elif item.get("plugType") == 1:
-                        target_dc = item.get("targetSOClevel", target_dc)
-            except Exception:
-                pass
 
+            #per-plug target list (robust against vehicle.data being a JSON string)
+            vd = self._safe_vehicle_data(car)
+            rci = vd.get("vehicleStatus", {}).get("evStatus", {}).get("reservChargeInfos", {})
+            for item in rci.get("targetSOClist", []) or []:
+                if item.get("plugType") == 0:
+                    target_ac = item.get("targetSOClevel", target_ac)
+                elif item.get("plugType") == 1:
+                    target_dc = item.get("targetSOClevel", target_dc)
             return {
                 "plugged_in": bool(getattr(car, "ev_battery_is_plugged_in", False)),
                 "charging":   bool(getattr(car, "ev_battery_is_charging", False)),
@@ -416,8 +444,9 @@ class BlueLinkSensor:
             self.vm.update_vehicle_with_cached_state(self.vehicle_id)
             vehicle = self.vm.get_vehicle(self.vehicle_id)
 
+            vd = self._safe_vehicle_data(vehicle)
             try:
-                target_soc_list = vehicle.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
+                target_soc_list = vd["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
                 return next(item["targetSOClevel"] for item in target_soc_list if item.get("plugType") == 0)
             except Exception:
                 # Fallback to top-level shortcut if the detailed list isn't present
@@ -436,9 +465,10 @@ class BlueLinkSensor:
             token_obj = self.vm.api.login(self.username, self.password)
             vehicle = self.vm.get_vehicle(self.vehicle_id)
 
-            # Read current DC target from vehicle data
-            target_soc_list = vehicle.data["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
-            dc_limit = next(item["targetSOClevel"] for item in target_soc_list if item["plugType"] == 1)
+            # Read current DC target from vehicle data (robust to JSON string)
+            vd = self._safe_vehicle_data(vehicle)
+            target_soc_list = vd["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
+            dc_limit = next(item["targetSOClevel"] for item in target_soc_list if item.get("plugType") == 1)
 
             # set_charge_limits(api_token, vehicle_obj, ac_limit, dc_limit)
             return self.vm.api.set_charge_limits(token_obj, vehicle, soc_level, dc_limit)
@@ -519,13 +549,25 @@ class WallboxCharger:
     def get_status(self) -> dict:
         self._ensure_session()
         raw_status = self._call_with_reauth(self.client.getChargerStatus, self.charger_id)
-        cfg = raw_status.get('config_data', {})
+
+        # --- harden against string / non-dict payloads ---
+        if isinstance(raw_status, str):
+            try:
+                import json as _json
+                raw_status = _json.loads(raw_status)
+            except Exception:
+                raw_status = {}
+        if not isinstance(raw_status, dict):
+            raw_status = {}
+
+        cfg = raw_status.get('config_data', {}) or {}
         current = cfg.get('max_charging_current')
         sid     = raw_status.get('status_id')
 
-        connected      = sid not in {0, 163}
-        charging_codes = {193, 194, 195}
-        charging       = sid in charging_codes
+        # Treat only known "disconnected" codes as not connected.
+        connected       = sid not in {0, 163}
+        charging_codes  = {193, 194, 195}
+        charging        = sid in charging_codes
 
         return {
             'current':   current,
@@ -634,6 +676,18 @@ def start(ctx):
             ev_status = bluelink.get_vehicle_status()
             charger_status = charger.get_status()
             state = None; amps_wanted = None; reason = ""
+            # --- type hardening (avoid 'str'.get crashes) ---
+            if isinstance(ev_status, str):
+                try: ev_status = json.loads(ev_status)
+                except Exception: ev_status = {}
+            if not isinstance(ev_status, dict):
+                ev_status = {}
+
+            if isinstance(charger_status, str):
+                try: charger_status = json.loads(charger_status)
+                except Exception: charger_status = {}
+            if not isinstance(charger_status, dict):
+                charger_status = {}
             click.echo({
                 "solar_power": readings["solar_power"],
                 "house_load": readings["house_load"],
@@ -725,7 +779,7 @@ def start(ctx):
 
                 # state resolution
                 
-                if not ev_status.get("plugged_in"):
+                if not plugged:
                     state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
                 elif target_reached:
                     state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
@@ -739,6 +793,8 @@ def start(ctx):
                         state = "WAIT_SOLAR"
                     
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
+                    # ensure readings_eff exists for any fallback compute_amps
+                    readings_eff = dict(readings); readings_eff["house_load"] = base_house
                     # decide target amps for this state
                     desired_a = amps_wanted
                     if desired_a is None:
@@ -771,17 +827,17 @@ def start(ctx):
                         last_set_current = desired_a
                         last_cmd_ts = time.time()
 
+                    # ensure charge session is running
                     if not charging_actual:
                         if plugged_evse:
-                            # Ensure AC target > current SOC so the car will actually start
                             try:
                                 ev_soc = ev_status.get("soc") or 0
-                                ac_soc = bluelink.get_ac_target_soc()  # may be None on some payloads
+                                ac_soc = bluelink.get_ac_target_soc()
                             except Exception:
-                                ac_soc = None  # be permissive if read fails
+                                ac_soc = None
 
                             bump_target = max(desired_target or ev_soc, ev_soc + 1)
-                            if (ac_soc is None) or (ac_soc <= ev_soc):
+                            if (ac_soc is None) or (ac_soc < bump_target):
                                 try:
                                     bluelink.set_ac_target_soc(min(100, bump_target))
                                 except Exception as e:
@@ -854,26 +910,24 @@ def start(ctx):
                         charger.set_current(amps_wanted)
                         if not charging_actual:
                             if plugged_evse:
-                                # Ensure AC target > current SOC so the car will actually start
                                 try:
                                     ev_soc = ev_status.get("soc") or 0
-                                    ac_soc = bluelink.get_ac_target_soc()  # may be None on some payloads
+                                    ac_soc = bluelink.get_ac_target_soc()
                                 except Exception:
-                                    ac_soc = None  # be permissive if read fails
+                                    ac_soc = None
 
                                 bump_target = max(desired_target or ev_soc, ev_soc + 1)
-                                if (ac_soc is None) or (ac_soc <= ev_soc):
+                                if (ac_soc is None) or (ac_soc < bump_target):
                                     try:
                                         bluelink.set_ac_target_soc(min(100, bump_target))
                                     except Exception as e:
                                         click.echo(f"set_ac_target_soc failed: {e}")
 
-                                    bluelink.start_charge()
-                                    click.echo("Starting charging")
-                                    last_cmd_ts = time.time()
-                                else:
-                                    click.echo("Skip start_charge: EVSE not connected")
-
+                                bluelink.start_charge()
+                                click.echo("Starting charging")
+                                last_cmd_ts = time.time()
+                            else:
+                                click.echo("Skip start_charge: EVSE not connected")
 
                     elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
                         if ev_status.get("charging"):
@@ -892,11 +946,50 @@ def start(ctx):
         except KeyboardInterrupt:
             click.echo("Exiting on Ctrl+C"); break
                 
+        #except Exception as e:
+        #    consec_errors += 1
+        #    backoff = min(2 * consec_errors, max_backoff)
+        #    click.echo(f"Tick error ({type(e).__name__}): {e}. Backing off {backoff}s, then continuing.")
+        #    time.sleep(backoff)
+
         except Exception as e:
             consec_errors += 1
             backoff = min(2 * consec_errors, max_backoff)
-            click.echo(f"Tick error ({type(e).__name__}): {e}. Backing off {backoff}s, then continuing.")
+            # --- DIAGNOSTIC: show exact line and inputs causing the crash ---
+            import traceback
+            exc_type = type(e).__name__
+            print(f"Tick error ({exc_type}): {e!r}. Backing off 2s, then continuing.")
+            # Full stacktrace with file & line numbers
+            traceback.print_exc()
+
+            # Dump the types and short previews of the loop inputs
+            def _short(x, n=400):
+                try:
+                    s = repr(x)
+                    return s if len(s) <= n else s[:n] + "...[trunc]"
+                except Exception:
+                    return f"<unrepr-able {type(x).__name__}>"
+
+            try:
+                print("DEBUG types:",
+                      "readings=", type(readings).__name__,
+                      "ev_status=", type(ev_status).__name__,
+                      "charger_status=", type(charger_status).__name__)
+            except NameError:
+                pass
+
+            try:
+                print("DEBUG previews:",
+                      "readings=", _short(readings),
+                      "ev_status=", _short(ev_status),
+                      "charger_status=", _short(charger_status))
+            except NameError:
+                pass
+
+            # keep existing behavior
             time.sleep(backoff)
+            continue
+
             
         # normal sleep to next tick (your poll_interval + jitter)
         next_tick += poll_s

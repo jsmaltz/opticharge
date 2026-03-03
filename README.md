@@ -27,3 +27,11 @@ Usage:
 
 python opticharge.py -c config.yaml start
 
+Fedora:
+
+service opticharge restart
+
+Show log:
+
+journalctl -u opticharge.service -f
+

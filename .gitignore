@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# Local credentials/configuration.
+config.yaml
+config.yaml.backup*
+
+# Runtime/build outputs.
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+

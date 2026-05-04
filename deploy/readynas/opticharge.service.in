@@ -1,0 +1,18 @@
+[Unit]
+Description=OptiCharge solar-aware EV charging controller
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@BASE_DIR@/venv/bin/python @APP_DIR@/opticharge.py -c @APP_DIR@/config.yaml start
+Restart=always
+RestartSec=30
+KillSignal=SIGINT
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
+

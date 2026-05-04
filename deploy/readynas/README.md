@@ -33,6 +33,25 @@ systemctl start opticharge.service
 The script enables the service for boot, but does not start it until you run
 `systemctl start opticharge.service`.
 
+## Updating the app
+
+Use this for normal source and pinned dependency updates:
+
+```sh
+cd /apps/opticharge/app
+sh deploy/readynas/update-app.sh
+```
+
+The update script:
+
+- refuses to run if tracked files have local changes
+- fast-forwards from `origin/main`
+- installs pinned `requirements.txt` into the existing venv
+- runs `pip check` and Python syntax checks
+- restarts `opticharge.service`
+
+It does not modify `config.yaml` and does not rebuild Python or OpenSSL.
+
 ## Service commands
 
 ```sh
@@ -53,4 +72,3 @@ The NETGEAR ReadyNAS apt repo may advertise development packages whose `.deb`
 URLs now return HTTP 403. To keep apt healthy, the script uses Debian archive
 build headers and repacks the libc development package metadata to match the
 installed NETGEAR libc version. Runtime libc is not replaced.
-

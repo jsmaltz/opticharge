@@ -8,7 +8,6 @@ from bluelink import BlueLink
 
 import logging
 import http.client as http_client
-import teslapy
 import requests
 import certifi
 import time
@@ -19,6 +18,9 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 
 import json
+from pathlib import Path
+from tesla_fleet import DEFAULT_API_BASE_URL, DEFAULT_TOKEN_URL, TeslaSensor
+from tesla_local import sensor_from_config as local_tesla_sensor_from_config
 # Turn on low-level HTTP debug logging
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
@@ -30,7 +32,7 @@ import json
 
 # ----- Sensors -----
 
-class TeslaSensor:
+class LegacyTeslaSensor:
     def __init__(
         self,
         refresh_token: str,
@@ -699,6 +701,38 @@ class DecisionEngine:
         amps = int(headroom / self.cfg['voltage'] // self.cfg['step_size'] * self.cfg['step_size'])
         return max(self.cfg['min_amps'], min(self.cfg['max_amps'], amps)), do_charge
 
+
+class DisabledTeslaSensor:
+    """Energy sensor used when Tesla integration is explicitly disabled."""
+
+    def get_house_power(self):
+        return {
+            "solar_power": 0.0,
+            "house_load": 0.0,
+            "battery_soc": None,
+        }
+
+
+def _build_tesla_sensor(cfg):
+    if not cfg.get("tesla_enabled", True):
+        return DisabledTeslaSensor()
+
+    if cfg.get("tesla_data_source", "fleet").lower() == "local":
+        return local_tesla_sensor_from_config(cfg)
+
+    token_cache = Path(cfg.get("tesla_token_cache", ".tesla-tokens.json"))
+    if not token_cache.is_absolute():
+        token_cache = Path(cfg["_config_directory"]) / token_cache
+    return TeslaSensor(
+        refresh_token=str(cfg.get("tesla_refresh_token", "")),
+        client_id=cfg["tesla_client_id"],
+        api_base_url=cfg.get("tesla_api_base_url", DEFAULT_API_BASE_URL),
+        token_url=cfg.get("tesla_token_url", DEFAULT_TOKEN_URL),
+        token_cache=token_cache,
+        site_id=cfg.get("tesla_site_id"),
+        timeout=float(cfg.get("tesla_timeout", 20)),
+    )
+
 # ----- CLI -----
 @click.group()
 @click.option('--config', '-c', default='config.yaml', help='Path to config file')
@@ -706,6 +740,7 @@ class DecisionEngine:
 def cli(ctx, config):
     with open(config) as f:
         cfg = yaml.safe_load(f)
+    cfg["_config_directory"] = str(Path(config).resolve().parent)
     logging.basicConfig(level=cfg.get('log_level', 'INFO'))
     ctx.obj = cfg
 
@@ -715,10 +750,10 @@ def start(ctx):
     cfg = ctx.obj
 
      # Initialize sensors and controllers
-    tesla = TeslaSensor(
-    refresh_token=cfg["tesla_refresh_token"],
-    client_id=cfg.get("tesla_client_id", "ownerapi")
-    )
+    tesla_enabled = cfg.get("tesla_enabled", True)
+    tesla = _build_tesla_sensor(cfg)
+    if not tesla_enabled:
+        click.echo("Tesla integration disabled; solar charging and battery gating are unavailable")
 
     bluelink = BlueLinkSensor(
         cfg,
@@ -831,10 +866,14 @@ def start(ctx):
                 click.echo({"eff_headroom": round(headroom,1), "evse_w": round(evse_w,1), "base_house": round(base_house,1)})
 
                 neg_headroom = headroom <= 0
-                batt_soc = readings.get("battery_soc", 0)
+                batt_soc = readings.get("battery_soc")
                 desired_target = cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
-                if headroom > engine.hysteresis and batt_soc >= cfg['battery_soc_full_threshold_high']:
+                battery_ready = (not tesla_enabled) or (
+                    batt_soc is not None
+                    and batt_soc >= cfg['battery_soc_full_threshold_high']
+                )
+                if headroom > engine.hysteresis and battery_ready:
                     desired_target = surplus_target
 
                 # 2) Ensure AC target SOC matches desired_target (apply once per mismatch)
@@ -899,8 +938,8 @@ def start(ctx):
                 # --- Maintenance: reconcile EVSE amps even without a state transition ---
 
                 # To avoid thrash, if the Powerwall has fallen past the low level, stop charging the EV
-                if state == "CHARGING_SOLAR":
-                    if readings.get("battery_soc") < cfg.get("battery_soc_full_threshold_low"):
+                if state == "CHARGING_SOLAR" and tesla_enabled:
+                    if batt_soc is not None and batt_soc < cfg.get("battery_soc_full_threshold_low"):
                         state = "WAIT_SOLAR"
                     
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
@@ -963,7 +1002,7 @@ def start(ctx):
                 else:
                     # Use EVSE-excluded house load for all surplus math
                     # Use PW SOC + effective headroom to allow solar charging
-                    batt_soc = readings.get("battery_soc", 0)
+                    batt_soc = readings.get("battery_soc")
                     batt_full_thr = int(cfg.get("battery_soc_full_threshold_high", 99))
 
                     
@@ -979,14 +1018,18 @@ def start(ctx):
                         readings_eff = dict(readings); readings_eff["house_load"] = base_house
                         amps_calc, do_charge = engine.compute_amps(readings_eff)
 
-                        if (batt_soc >= batt_full_thr) and (headroom > getattr(engine, "hysteresis", 0)):
+                        battery_ready = (not tesla_enabled) or (
+                            batt_soc is not None and batt_soc >= batt_full_thr
+                        )
+                        if battery_ready and (headroom > getattr(engine, "hysteresis", 0)):
                             # set amps to soak up the actual surplus
                             amps_wanted = engine.compute_amps(readings)[0]
                             state = "CHARGING_SOLAR"; reason = "solar surplus"
                         else:
                             state = "WAIT_SOLAR"; amps_wanted = None
-                            if batt_soc < batt_full_thr:
-                                reason = f"PW SOC {batt_soc:.1f}% < {batt_full_thr}%"
+                            if tesla_enabled and (batt_soc is None or batt_soc < batt_full_thr):
+                                batt_label = "unknown" if batt_soc is None else f"{batt_soc:.1f}%"
+                                reason = f"PW SOC {batt_label} < {batt_full_thr}%"
                             else:
                                 reason = "waiting for solar"                # Never keep CHARGING_GRID outside its window
                 if state == "CHARGING_GRID" and not in_grid_window:

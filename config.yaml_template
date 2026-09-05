@@ -1,7 +1,23 @@
-# Tesla / Home energy
-tesla_email: ""
-tesla_password: ""
-tesla_refresh_token: ""
+# Tesla Fleet API / home energy
+# Create an application at https://developer.tesla.com/ with the
+# energy_device_data scope. The client secret is only used by tesla_auth.py.
+tesla_enabled: true          # false: make no Tesla requests; grid-window charging still works
+tesla_data_source: "local"   # local: Powerwall Gateway; fleet: Tesla cloud Fleet API
+tesla_gateway_url: "https://10.254.0.45"
+tesla_gateway_username: "customer"
+tesla_gateway_password: ""   # Custom local customer password; keep private
+tesla_gateway_email: ""      # Tesla account email; some Gateway firmware requires it
+tesla_gateway_timeout: 10
+tesla_gateway_verify_tls: false  # Gateway normally uses a self-signed certificate
+tesla_client_id: ""
+tesla_client_secret: ""
+tesla_redirect_uri: "https://your-registered-domain.example/tesla/callback"
+tesla_api_base_url: "https://fleet-api.prd.na.vn.cloud.tesla.com"
+tesla_token_url: "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token"
+tesla_token_cache: ".tesla-tokens.json"
+tesla_timeout: 20
+# Optional when the account contains more than one energy site:
+# tesla_site_id: ""
 
 # Hyundai BlueLink (for EV status)
 bluelink_user: ""

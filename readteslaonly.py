@@ -8,7 +8,6 @@ from bluelink import BlueLink
 
 import logging
 import http.client as http_client
-import teslapy
 import requests
 import certifi
 import time
@@ -19,6 +18,9 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 
 import json
+from pathlib import Path
+from tesla_fleet import DEFAULT_API_BASE_URL, DEFAULT_TOKEN_URL, TeslaSensor
+from tesla_local import sensor_from_config as local_tesla_sensor_from_config
 # Turn on low-level HTTP debug logging
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
@@ -31,7 +33,7 @@ import json
 
 # ----- Sensors -----
 
-class TeslaSensor:
+class LegacyTeslaSensor:
     def __init__(
         self,
         refresh_token: str,
@@ -524,6 +526,7 @@ class DecisionEngine:
 def cli(ctx, config):
     with open(config) as f:
         cfg = yaml.safe_load(f)
+    cfg["_config_directory"] = str(Path(config).resolve().parent)
     logging.basicConfig(level=cfg.get('log_level', 'INFO'))
     ctx.obj = cfg
 
@@ -533,10 +536,21 @@ def start(ctx):
     cfg = ctx.obj
 
      # Initialize sensors and controllers
-    tesla = TeslaSensor(
-    refresh_token=cfg["tesla_refresh_token"],
-    client_id=cfg.get("tesla_client_id", "ownerapi")
-    )
+    if cfg.get("tesla_data_source", "fleet").lower() == "local":
+        tesla = local_tesla_sensor_from_config(cfg)
+    else:
+        token_cache = Path(cfg.get("tesla_token_cache", ".tesla-tokens.json"))
+        if not token_cache.is_absolute():
+            token_cache = Path(cfg["_config_directory"]) / token_cache
+        tesla = TeslaSensor(
+            refresh_token=str(cfg.get("tesla_refresh_token", "")),
+            client_id=cfg["tesla_client_id"],
+            api_base_url=cfg.get("tesla_api_base_url", DEFAULT_API_BASE_URL),
+            token_url=cfg.get("tesla_token_url", DEFAULT_TOKEN_URL),
+            token_cache=token_cache,
+            site_id=cfg.get("tesla_site_id"),
+            timeout=float(cfg.get("tesla_timeout", 20)),
+        )
 
     click.echo('Starting measurement loop...')
 

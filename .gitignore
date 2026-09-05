@@ -4,6 +4,9 @@ __pycache__/
 # Local credentials/configuration.
 config.yaml
 config.yaml.backup*
+.tesla-tokens.json
+.tesla-private-key.pem
+.tesla-pages/
 
 # Runtime/build outputs.
 .venv/
@@ -11,4 +14,3 @@ venv/
 build/
 dist/
 *.egg-info/
-

@@ -30,6 +30,20 @@ sh deploy/readynas/install-runtime.sh
 systemctl start opticharge.service
 ```
 
+For local Gateway deployments, set `tesla_data_source: local` and the
+`tesla_gateway_*` values in the private `config.yaml`. Confirm connectivity
+from the NAS before starting the service:
+
+```sh
+/apps/opticharge/venv/bin/python /apps/opticharge/app/tesla_local.py \
+  -c /apps/opticharge/app/config.yaml
+```
+
+For Fleet API deployments, also copy the `.tesla-tokens.json` created by
+`tesla_auth.py authorize` into the application directory. Keep it private and
+owned by the account that runs the service; the runtime updates it whenever
+Tesla rotates the refresh token.
+
 The script enables the service for boot, but does not start it until you run
 `systemctl start opticharge.service`.
 

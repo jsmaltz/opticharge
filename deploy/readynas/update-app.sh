@@ -39,7 +39,7 @@ new_head=$(git rev-parse --short HEAD)
 
 "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 "$VENV_DIR/bin/python" -m pip check
-"$VENV_DIR/bin/python" -m py_compile opticharge.py readteslaonly.py
+"$VENV_DIR/bin/python" -m py_compile opticharge.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
 
 systemctl restart "$SERVICE_NAME"
 sleep 5

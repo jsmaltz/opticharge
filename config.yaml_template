@@ -55,5 +55,34 @@ ev_target_soc_solar_surplus: 100 # go higher instead of sending back to grid
 bluelink_refresh_fail_count: 1
 battery_soc_full_threshold_low: 50 # Powerwall level to stop solar charging of ev
 battery_soc_full_threshold_high: 55 # Powerwall level to start solar charging of ev
+
+# Solar forecast and overnight policy. Open-Meteo uses 0 degrees for south,
+# -90 for east, and +90 for west. Keep disabled until the site values are set.
+solar_forecast_enabled: false
+latitude: null
+longitude: null
+panel_capacity_kw: null
+panel_tilt: 30
+panel_azimuth: 0
+solar_forecast_performance_ratio: 0.80
+solar_forecast_refresh_hours: 1
+solar_forecast_stale_hours: 6
+solar_forecast_timeout: 10
+solar_forecast_poor_kwh: 15
+solar_forecast_good_kwh: 35
+
+# The floor always applies during the grid window. Forecast-specific values can
+# raise it on a poor solar day; good days initially retain the safe 50% floor.
+grid_powerwall_floor_soc: 50
+# At a five-minute polling interval, stop slightly early to avoid crossing the
+# true floor before the next Gateway reading arrives.
+grid_powerwall_stop_margin_soc: 2
+forecast_powerwall_floor_poor: 65
+forecast_powerwall_floor_average: 50
+forecast_powerwall_floor_good: 50
+forecast_ev_target_poor: 80
+forecast_ev_target_average: 70
+forecast_ev_target_good: 60
+forecast_ev_target_default: 80
 # EV battery capacity
 ev_battery_capacity_kwh: 84.0

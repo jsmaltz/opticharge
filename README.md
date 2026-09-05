@@ -14,6 +14,23 @@ back to grid.
 - **Vehicle re-auth** – automatic BlueLink reauthentication and retry on failure.
 - **Dynamic charging current ** – real-time adjustment to soak up surplus.
 - **Anti-thrash** – cooldown timers for start/stop and current changes.
+- **Solar forecasting** – optional Open-Meteo forecasts adjust the overnight EV
+  target and Powerwall safety floor.
+
+## Solar forecast and overnight Powerwall floor
+
+OptiCharge can use Open-Meteo's hourly global tilted irradiance forecast to
+classify tomorrow as a poor, average, or good solar day. The classification
+selects an overnight EV target and Powerwall floor. Configure the site latitude,
+longitude, array capacity, panel tilt, and panel azimuth in `config.yaml`, then
+set `solar_forecast_enabled: true`. Open-Meteo defines south as 0 degrees, east
+as -90, and west as +90.
+
+The fixed `grid_powerwall_floor_soc` remains active when forecasting is disabled
+or unavailable. A recent successful forecast is cached for up to
+`solar_forecast_stale_hours`; after that, OptiCharge falls back to the default
+EV target and fixed floor. The initial template never lets a favorable forecast
+lower the Powerwall below 50%.
 
 ## Requirements
 

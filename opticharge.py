@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 from tesla_fleet import DEFAULT_API_BASE_URL, DEFAULT_TOKEN_URL, TeslaSensor
 from tesla_local import sensor_from_config as local_tesla_sensor_from_config
+from solar_forecast import SolarForecast
 # Turn on low-level HTTP debug logging
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
@@ -775,6 +776,7 @@ def start(ctx):
         password=cfg['wallbox_pass']
     )
     engine = DecisionEngine(cfg)
+    solar_forecast = SolarForecast(cfg)
     interval = cfg.get('poll_interval', 300)
     last_state = None
     last_cmd_ts = 0.0
@@ -867,7 +869,19 @@ def start(ctx):
 
                 neg_headroom = headroom <= 0
                 batt_soc = readings.get("battery_soc")
-                desired_target = cfg["ev_target_soc"]
+                now = datetime.now()
+                in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
+                try:
+                    overnight_plan = solar_forecast.get_overnight_plan(now)
+                except Exception as exc:
+                    overnight_plan = solar_forecast._fallback("error")
+                    click.echo(f"Solar forecast unavailable: {exc}")
+
+                overnight_target = overnight_plan.ev_target_soc
+                powerwall_floor = overnight_plan.powerwall_floor_soc
+                powerwall_stop_margin = float(cfg.get("grid_powerwall_stop_margin_soc", 2))
+                powerwall_stop_at = powerwall_floor + powerwall_stop_margin
+                desired_target = overnight_target if in_grid_window else cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
                 battery_ready = (not tesla_enabled) or (
                     batt_soc is not None
@@ -887,15 +901,18 @@ def start(ctx):
 
                 # 3) Classify state: TARGET_REACHED, CHARGING_GRID, CHARGING_SOLAR, WAIT_SOLAR, UNPLUGGED
                 ev_charge_level = ev_status.get("soc") or 0
-                now = datetime.now()
-                in_grid_window = _in_window(now, cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"])
-
                 # Safety: no solar surplus outside grid window → force WAIT_SOLAR immediately
                 if headroom <= 0 and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "negative headroom (safety)"
                 click.echo({"now": now.strftime("%F %T"), 
                        "grid_window": [cfg["grid_charge_start_hour"], cfg["grid_charge_end_hour"]], 
-                       "in_grid_window": in_grid_window})
+                       "in_grid_window": in_grid_window,
+                       "forecast": overnight_plan.classification,
+                       "forecast_kwh": overnight_plan.forecast_kwh,
+                       "forecast_date": overnight_plan.forecast_date,
+                       "overnight_ev_target": overnight_target,
+                       "powerwall_floor": powerwall_floor,
+                       "forecast_source": overnight_plan.source})
 
                 if headroom <= 0 and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "negative headroom (safety)"
@@ -904,7 +921,7 @@ def start(ctx):
 
                 # decide amps for grid window if applicable
                 grid_amps = None
-                if in_grid_window and ev_charge_level < cfg["ev_target_soc"]:
+                if in_grid_window and ev_charge_level < overnight_target:
                     if cfg.get("grid_charge_fast", False):
                         grid_amps = cfg["grid_charge_fast_amps"]
                     else:
@@ -919,7 +936,7 @@ def start(ctx):
                                     end += timedelta(days=1)
                             hours_left = max(0.1, (end - now).total_seconds() / 3600.0)  # prevent div/0
                             if "ev_battery_capacity_kwh" in cfg:
-                                needed_kwh = max(0.0, (cfg["ev_target_soc"] - ev_charge_level) / 100.0 * cfg["ev_battery_capacity_kwh"])
+                                needed_kwh = max(0.0, (overnight_target - ev_charge_level) / 100.0 * cfg["ev_battery_capacity_kwh"])
                                 amps = int(needed_kwh * 1000.0 / (cfg["voltage"] * hours_left))
                                 grid_amps = max(cfg["min_amps"], min(cfg["max_amps"], amps))
                             else:
@@ -933,6 +950,17 @@ def start(ctx):
                     state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
                 elif target_reached:
                     state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
+                elif (
+                    tesla_enabled
+                    and in_grid_window
+                    and batt_soc is not None
+                    and batt_soc <= powerwall_stop_at
+                ):
+                    state = "WAIT_POWERWALL"; amps_wanted = None
+                    reason = (
+                        f"PW SOC {batt_soc:.1f}% reached {powerwall_floor:.1f}% "
+                        f"floor guard"
+                    )
                 elif in_grid_window and grid_amps:
                     state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
                 # --- Maintenance: reconcile EVSE amps even without a state transition ---
@@ -999,7 +1027,7 @@ def start(ctx):
                         else:
                             click.echo("Skip start_charge: EVSE not connected")
 
-                else:
+                elif state is None:
                     # Use EVSE-excluded house load for all surplus math
                     # Use PW SOC + effective headroom to allow solar charging
                     batt_soc = readings.get("battery_soc")
@@ -1023,7 +1051,7 @@ def start(ctx):
                         )
                         if battery_ready and (headroom > getattr(engine, "hysteresis", 0)):
                             # set amps to soak up the actual surplus
-                            amps_wanted = engine.compute_amps(readings)[0]
+                            amps_wanted = engine.compute_amps(readings_eff)[0]
                             state = "CHARGING_SOLAR"; reason = "solar surplus"
                         else:
                             state = "WAIT_SOLAR"; amps_wanted = None
@@ -1049,7 +1077,8 @@ def start(ctx):
 
                 # 4) Act only on transitions or after cooldown to avoid thrash
                 now_ts = time.time()
-                should_stop_now = (state in ("TARGET_REACHED", "WAIT_SOLAR")) and charging_actual and not in_grid_window
+                stop_states = ("TARGET_REACHED", "WAIT_SOLAR", "WAIT_POWERWALL")
+                should_stop_now = state in stop_states and charging_actual
                 # Safety: never keep CHARGING_GRID outside its window
                 if state == "CHARGING_GRID" and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
@@ -1083,8 +1112,8 @@ def start(ctx):
                             else:
                                 click.echo("Skip start_charge: EVSE not connected")
 
-                    elif state in ("TARGET_REACHED", "WAIT_SOLAR"):
-                        if ev_status.get("charging"):
+                    elif state in stop_states:
+                        if charging_actual:
                             charger.set_current(cfg["default_amps"])
                             bluelink.stop_charge()
                             click.echo(f"Stopping charging")

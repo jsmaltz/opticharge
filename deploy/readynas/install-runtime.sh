@@ -154,7 +154,7 @@ install_venv() {
     cd "$APP_DIR"
     "$VENV_DIR/bin/python" -m pip install -r requirements.txt
     "$VENV_DIR/bin/python" -m pip check
-    "$VENV_DIR/bin/python" -m py_compile opticharge.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
+    "$VENV_DIR/bin/python" -m py_compile opticharge.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
 }
 
 install_service() {

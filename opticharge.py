@@ -723,6 +723,16 @@ class WallboxCharger:
         self._ensure_session()
         return self._call_with_reauth(self.client.setMaxChargingCurrent, self.charger_id, amps)
 
+    def pause_charging(self):
+        """Suspend the EVSE so a delayed vehicle-side start cannot draw power."""
+        self._ensure_session()
+        return self._call_with_reauth(self.client.pauseChargingSession, self.charger_id)
+
+    def resume_charging(self):
+        """Enable the EVSE immediately before requesting a vehicle-side start."""
+        self._ensure_session()
+        return self._call_with_reauth(self.client.resumeChargingSession, self.charger_id)
+
     def get_status(self) -> dict:
         self._ensure_session()
         raw_status = self._call_with_reauth(self.client.getChargerStatus, self.charger_id)
@@ -776,6 +786,51 @@ class DisabledTeslaSensor:
             "house_load": 0.0,
             "battery_soc": None,
         }
+
+
+def _command_charging_start(charger, bluelink, ev_status, desired_target):
+    """Issue one coordinated EVSE/vehicle start request."""
+    charger.resume_charging()
+    ev_soc = ev_status.get("soc") or 0
+    try:
+        ac_soc = bluelink.get_ac_target_soc()
+    except Exception:
+        ac_soc = None
+
+    bump_target = max(desired_target or ev_soc, ev_soc + 1)
+    if (ac_soc is None) or (ac_soc < bump_target):
+        try:
+            bluelink.set_ac_target_soc(min(100, bump_target))
+        except Exception as exc:
+            click.echo(f"set_ac_target_soc failed: {exc}")
+
+    bluelink.start_charge()
+
+
+def _command_charging_stop(charger, bluelink, default_amps):
+    """Fail closed by suspending both charging paths regardless of telemetry."""
+    errors = []
+    for operation in (
+        charger.pause_charging,
+        lambda: charger.set_current(default_amps),
+        bluelink.stop_charge,
+    ):
+        try:
+            operation()
+        except Exception as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[0]
+
+
+STOP_CHARGE_STATES = ("TARGET_REACHED", "WAIT_SOLAR", "WAIT_POWERWALL")
+
+
+def _should_stop_charging(state, last_state, charging_evse, charging_bl):
+    """Stop on entry to a safe state, or immediately if charging reappears."""
+    return state in STOP_CHARGE_STATES and (
+        state != last_state or charging_evse or charging_bl
+    )
 
 
 def _build_tesla_sensor(cfg):
@@ -850,6 +905,7 @@ def start(ctx):
     interval = cfg.get('poll_interval', 300)
     last_state = None
     last_cmd_ts = 0.0
+    last_startstop_ts = 0.0
     MIN_CMD_INTERVAL = cfg.get("min_cmd_interval_s", 20)
     MIN_STARTSTOP_INTERVAL = cfg.get("min_startstop_interval_s", 60)
     
@@ -1033,13 +1089,14 @@ def start(ctx):
                     )
                 elif in_grid_window and grid_amps:
                     state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
-                # --- Maintenance: reconcile EVSE amps even without a state transition ---
-
                 # To avoid thrash, if the Powerwall has fallen past the low level, stop charging the EV
                 if state == "CHARGING_SOLAR" and tesla_enabled:
                     if batt_soc is not None and batt_soc < cfg.get("battery_soc_full_threshold_low"):
                         state = "WAIT_SOLAR"
-                    
+
+                # Reconcile EVSE amps without issuing start/stop commands here. Session
+                # control is deliberately centralized below so one tick can only issue
+                # one coordinated start or stop request.
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
                     # ensure readings_eff exists for any fallback compute_amps
                     readings_eff = dict(readings); readings_eff["house_load"] = base_house
@@ -1070,32 +1127,9 @@ def start(ctx):
                             desired_a = min(cur_a + ramp, desired_a)
                         else:
                             desired_a = max(cur_a - ramp, desired_a)
-
-                        charger.set_current(desired_a)
-                        last_set_current = desired_a
-                        last_cmd_ts = time.time()
-
-                    # ensure charge session is running
-                    if not charging_actual:
-                        if plugged_evse:
-                            try:
-                                ev_soc = ev_status.get("soc") or 0
-                                ac_soc = bluelink.get_ac_target_soc()
-                            except Exception:
-                                ac_soc = None
-
-                            bump_target = max(desired_target or ev_soc, ev_soc + 1)
-                            if (ac_soc is None) or (ac_soc < bump_target):
-                                try:
-                                    bluelink.set_ac_target_soc(min(100, bump_target))
-                                except Exception as e:
-                                    click.echo(f"set_ac_target_soc failed: {e}")
-
-                            bluelink.start_charge()
-                            click.echo("Starting charging")
-                            last_cmd_ts = time.time()
-                        else:
-                            click.echo("Skip start_charge: EVSE not connected")
+                        amps_wanted = desired_a
+                    else:
+                        amps_wanted = cur_a
 
                 elif state is None:
                     # Use EVSE-excluded house load for all surplus math
@@ -1145,52 +1179,57 @@ def start(ctx):
                        "charging_evse": charging_evse, "charging_bl": charging_bl})
 
 
-                # 4) Act only on transitions or after cooldown to avoid thrash
+                # 4) Apply all EVSE/vehicle actions in one place.
                 now_ts = time.time()
-                stop_states = ("TARGET_REACHED", "WAIT_SOLAR", "WAIT_POWERWALL")
-                should_stop_now = state in stop_states and charging_actual
                 # Safety: never keep CHARGING_GRID outside its window
                 if state == "CHARGING_GRID" and not in_grid_window:
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
 
-                should_act = (state != last_state) or ((now_ts - last_cmd_ts) > MIN_STARTSTOP_INTERVAL) or should_stop_now
-
-                if should_act:
-                    if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
-                        if amps_wanted is None:
-                            # final belt & suspenders
-                            amps_wanted = engine.compute_amps(readings)[0]
+                state_changed = state != last_state
+                if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
+                    if amps_wanted is None:
+                        # final belt & suspenders
+                        amps_wanted = engine.compute_amps(readings)[0]
+                    current_a = int(charger_status.get("current") or cfg.get("default_amps", 6))
+                    if amps_wanted != current_a and amps_wanted != last_set_current:
                         charger.set_current(amps_wanted)
-                        if not charging_actual:
-                            if plugged_evse:
-                                try:
-                                    ev_soc = ev_status.get("soc") or 0
-                                    ac_soc = bluelink.get_ac_target_soc()
-                                except Exception:
-                                    ac_soc = None
+                        last_set_current = amps_wanted
+                        last_cmd_ts = now_ts
 
-                                bump_target = max(desired_target or ev_soc, ev_soc + 1)
-                                if (ac_soc is None) or (ac_soc < bump_target):
-                                    try:
-                                        bluelink.set_ac_target_soc(min(100, bump_target))
-                                    except Exception as e:
-                                        click.echo(f"set_ac_target_soc failed: {e}")
+                    should_start = (
+                        not charging_actual
+                        and (
+                            state_changed
+                            or (now_ts - last_startstop_ts) > MIN_STARTSTOP_INTERVAL
+                        )
+                    )
+                    if should_start:
+                        if plugged_evse:
+                            _command_charging_start(
+                                charger, bluelink, ev_status, desired_target
+                            )
+                            click.echo("Starting charging")
+                            last_startstop_ts = now_ts
+                        else:
+                            click.echo("Skip start_charge: EVSE not connected")
 
-                                bluelink.start_charge()
-                                click.echo("Starting charging")
-                                last_cmd_ts = time.time()
-                            else:
-                                click.echo("Skip start_charge: EVSE not connected")
+                elif state in STOP_CHARGE_STATES:
+                    # Act on entry even if both APIs currently say idle. This clears
+                    # a previously accepted start that the vehicle may execute later.
+                    should_stop = _should_stop_charging(
+                        state, last_state, charging_evse, charging_bl
+                    )
+                    if should_stop:
+                        _command_charging_stop(
+                            charger, bluelink, cfg["default_amps"]
+                        )
+                        click.echo("Charging suspended")
+                        last_startstop_ts = now_ts
+                        last_cmd_ts = now_ts
+                        last_set_current = cfg["default_amps"]
 
-                    elif state in stop_states:
-                        if charging_actual:
-                            charger.set_current(cfg["default_amps"])
-                            bluelink.stop_charge()
-                            click.echo(f"Stopping charging")
-                            last_cmd_ts = now_ts
-
-                    # UNPLUGGED or anything else → no action
-                    last_state = state
+                # UNPLUGGED or anything else → no action
+                last_state = state
 
             else:
                 click.echo("Vehicle not plugged in; skipping")

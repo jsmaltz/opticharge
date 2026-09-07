@@ -3,7 +3,14 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from opticharge import DisabledTeslaSensor, WallboxCharger, _build_tesla_sensor
+from opticharge import (
+    DisabledTeslaSensor,
+    WallboxCharger,
+    _build_tesla_sensor,
+    _command_charging_start,
+    _command_charging_stop,
+    _should_stop_charging,
+)
 
 
 class DisabledTeslaSensorTests(unittest.TestCase):
@@ -131,6 +138,73 @@ class WallboxHardeningTests(unittest.TestCase):
             charger._ensure_session()
 
         charger.client.authenticate.assert_not_called()
+
+    def test_pause_and_resume_use_hardened_api_wrapper(self):
+        charger = bare_charger()
+        charger.charger_id = 123
+        charger._ensure_session = Mock()
+        charger._call_with_reauth = Mock(side_effect=["paused", "resumed"])
+
+        self.assertEqual(charger.pause_charging(), "paused")
+        self.assertEqual(charger.resume_charging(), "resumed")
+
+        self.assertEqual(charger._ensure_session.call_count, 2)
+        self.assertEqual(charger._call_with_reauth.call_count, 2)
+        self.assertIs(
+            charger._call_with_reauth.call_args_list[0].args[0],
+            charger.client.pauseChargingSession,
+        )
+        self.assertIs(
+            charger._call_with_reauth.call_args_list[1].args[0],
+            charger.client.resumeChargingSession,
+        )
+
+
+class ChargingCommandTests(unittest.TestCase):
+    def test_start_issues_one_coordinated_request(self):
+        charger = Mock()
+        bluelink = Mock()
+        bluelink.get_ac_target_soc.return_value = 50
+
+        _command_charging_start(charger, bluelink, {"soc": 59}, 60)
+
+        charger.resume_charging.assert_called_once_with()
+        bluelink.set_ac_target_soc.assert_called_once_with(60)
+        bluelink.start_charge.assert_called_once_with()
+
+    def test_stop_suspends_both_paths_even_when_telemetry_was_idle(self):
+        charger = Mock()
+        bluelink = Mock()
+
+        self.assertTrue(
+            _should_stop_charging("WAIT_POWERWALL", "CHARGING_GRID", False, False)
+        )
+        _command_charging_stop(charger, bluelink, 9)
+
+        charger.pause_charging.assert_called_once_with()
+        charger.set_current.assert_called_once_with(9)
+        bluelink.stop_charge.assert_called_once_with()
+
+    def test_unchanged_idle_stop_state_does_not_repeat_commands(self):
+        self.assertFalse(
+            _should_stop_charging("WAIT_POWERWALL", "WAIT_POWERWALL", False, False)
+        )
+
+    def test_charging_reappearing_in_stop_state_is_stopped_again(self):
+        self.assertTrue(
+            _should_stop_charging("WAIT_POWERWALL", "WAIT_POWERWALL", True, False)
+        )
+
+    def test_stop_attempts_vehicle_command_if_wallbox_pause_fails(self):
+        charger = Mock()
+        bluelink = Mock()
+        charger.pause_charging.side_effect = RuntimeError("wallbox unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "wallbox unavailable"):
+            _command_charging_stop(charger, bluelink, 9)
+
+        charger.set_current.assert_called_once_with(9)
+        bluelink.stop_charge.assert_called_once_with()
 
 
 if __name__ == "__main__":

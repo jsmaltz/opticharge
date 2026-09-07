@@ -15,7 +15,7 @@ DEFAULT_LINES = 400
 MAX_LINES = 2000
 
 
-PAGE = """<!doctype html>
+PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">

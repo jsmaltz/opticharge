@@ -2,10 +2,14 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from log_viewer import bounded_line_count, client_is_private, read_journal, service_status
+from log_viewer import PAGE, bounded_line_count, client_is_private, read_journal, service_status
 
 
 class LogViewerTests(unittest.TestCase):
+    def test_embedded_javascript_preserves_newline_escapes(self):
+        self.assertIn(r"raw.split('\n')", PAGE)
+        self.assertIn(r".join('\n')", PAGE)
+
     def test_allows_private_and_loopback_clients(self):
         self.assertTrue(client_is_private("10.0.0.25"))
         self.assertTrue(client_is_private("192.168.1.8"))

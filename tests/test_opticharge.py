@@ -1,10 +1,12 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import requests
 
 from opticharge import (
     DisabledTeslaSensor,
+    BlueLinkSensor,
     WallboxCharger,
     _build_tesla_sensor,
     _command_charging_start,
@@ -30,6 +32,98 @@ class DisabledTeslaSensorTests(unittest.TestCase):
 
         self.assertIsInstance(sensor, DisabledTeslaSensor)
         tesla_sensor.assert_not_called()
+
+
+def bare_bluelink(reinit_failures=3):
+    sensor = object.__new__(BlueLinkSensor)
+    sensor.cfg = {}
+    sensor.username = "user"
+    sensor.password = "password"
+    sensor.pin = "1234"
+    sensor.vin = "VIN"
+    sensor.region_id = 3
+    sensor.brand_id = 2
+    sensor.vehicle_id = "vehicle-id"
+    sensor._status_failure_count = 0
+    sensor._using_cached_status = False
+    sensor._last_good_status = None
+    sensor._last_good_status_at = 0.0
+    sensor._reinit_failure_threshold = reinit_failures
+    sensor.vm = Mock()
+    sensor.vm.token = object()
+    return sensor
+
+
+class BlueLinkRefreshTests(unittest.TestCase):
+    def test_api_call_checks_token_before_operation(self):
+        sensor = bare_bluelink()
+        operation = Mock(return_value="ok")
+
+        self.assertEqual(sensor._call_with_reauth(operation), "ok")
+
+        sensor.vm.check_and_refresh_token.assert_called_once_with()
+        operation.assert_called_once_with()
+
+    def test_ac_target_uses_existing_snapshot_without_second_refresh(self):
+        sensor = bare_bluelink()
+        vehicle = SimpleNamespace(
+            data={
+                "vehicleStatus": {
+                    "evStatus": {
+                        "reservChargeInfos": {
+                            "targetSOClist": [
+                                {"plugType": 0, "targetSOClevel": 80}
+                            ]
+                        }
+                    }
+                }
+            },
+            ev_charge_limits_ac=70,
+        )
+        sensor.vm.get_vehicle.return_value = vehicle
+
+        self.assertEqual(sensor.get_ac_target_soc(), 80)
+
+        sensor.vm.update_vehicle_with_cached_state.assert_not_called()
+        sensor.vm.check_and_refresh_token.assert_not_called()
+
+    @patch("opticharge.time.time", return_value=1300.0)
+    def test_partial_payload_returns_last_good_status_without_reinit(self, now):
+        sensor = bare_bluelink(reinit_failures=3)
+        sensor._last_good_status = {"soc": 61, "charging": False}
+        sensor._last_good_status_at = 1000.0
+        sensor._refresh_status = Mock(side_effect=KeyError("vehicleStatus"))
+        sensor._full_reinit_bluelink = Mock()
+
+        status = sensor.get_vehicle_status()
+
+        self.assertEqual(status["soc"], 61)
+        self.assertTrue(status["data_stale"])
+        self.assertEqual(status["data_age_seconds"], 300)
+        sensor._full_reinit_bluelink.assert_not_called()
+
+    def test_client_rebuild_waits_for_three_failed_polls(self):
+        sensor = bare_bluelink(reinit_failures=3)
+        sensor._last_good_status = {"soc": 61}
+        sensor._last_good_status_at = 0.0
+        fresh = {"soc": 62, "data_stale": False, "data_age_seconds": 0}
+        sensor._refresh_status = Mock(
+            side_effect=[
+                KeyError("vehicleStatus"),
+                KeyError("vehicleStatus"),
+                KeyError("vehicleStatus"),
+                fresh,
+            ]
+        )
+        sensor._full_reinit_bluelink = Mock()
+
+        self.assertTrue(sensor.get_vehicle_status()["data_stale"])
+        self.assertTrue(sensor.get_vehicle_status()["data_stale"])
+        self.assertEqual(sensor.get_vehicle_status()["soc"], 62)
+
+        sensor._full_reinit_bluelink.assert_called_once_with()
+        self.assertEqual(sensor._status_failure_count, 0)
+        self.assertFalse(sensor._using_cached_status)
 
 
 def http_error(status, retry_after=None):

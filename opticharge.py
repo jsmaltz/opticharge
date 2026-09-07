@@ -197,7 +197,8 @@ class LegacyTeslaSensor:
         }
 
 class BlueLinkSensor:
-    
+    """BlueLink adapter with proactive token refresh and stale-data fallback."""
+
     def __init__(
         self,
         cfg,
@@ -206,13 +207,17 @@ class BlueLinkSensor:
         pin: str,
         region_cfg: int | str,
         brand_cfg: int | str,
-        vin: str):
+        vin: str,
+    ):
+        self.cfg = cfg
+        self._status_failure_count = 0
+        self._using_cached_status = False
+        self._last_good_status = None
+        self._last_good_status_at = 0.0
+        self._reinit_failure_threshold = max(
+            1, int(cfg.get("bluelink_reinit_fail_count", 3))
+        )
 
-        self._bluelink_fail_count = 0
-        self._bluelink_cooloff_until = 0  # epoch seconds
-        self._refresh_fail_count = 0
-        self.cfg=cfg
-        # normalize region and brand 
         regions = const.REGIONS
         if isinstance(region_cfg, int) and region_cfg in regions:
             region_id = region_cfg
@@ -228,297 +233,216 @@ class BlueLinkSensor:
             brand_id = next(k for k, v in brands.items() if v == brand_cfg)
         else:
             raise ValueError(f"Unknown brand '{brand_cfg}'.")
+
         self.username = username
         self.password = password
         self.region_id = region_id
         self.brand_id = brand_id
         self.pin = pin
         self.vin = vin
-
         self.authenticate()
-    
+
     def _safe_vehicle_data(self, vehicle) -> dict:
-        """
-        Return vehicle.data as a dict. If it's a JSON string or anything else,
-        parse or fall back to {} so .get(...) is always safe.
-        """
-        d = getattr(vehicle, "data", None)
-        if isinstance(d, str):
+        data = getattr(vehicle, "data", None)
+        if isinstance(data, str):
             try:
-                d = json.loads(d)
-            except Exception:
-                d = {}
-        if not isinstance(d, dict):
-            d = {}
-        return d
+                data = json.loads(data)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                data = {}
+        return data if isinstance(data, dict) else {}
 
-    def authenticate(self):
-        self.vm = VehicleManager(
-            region=self.region_id,
-            brand=self.brand_id,
-            username=self.username,
-            password=self.password,
-            pin=self.pin
-        )
-        self.vm.check_and_refresh_token()
-        
-        # Map your real VIN to the internal ID, trying both .VIN and .vin
-        self.vehicle_id = None
-        for internal_id, vehicle in self.vm.vehicles.items():
-            vehicle_vin = getattr(vehicle, 'vin',
-                           getattr(vehicle, 'VIN', None))
-            if vehicle_vin == self.vin:
-                self.vehicle_id = internal_id
-                break
-        if self.vehicle_id is None:
-            available = [getattr(v, 'vin', getattr(v, 'VIN', None))
-                         for v in self.vm.vehicles.values()]
-            raise RuntimeError(f"VIN '{self.vin}' not found; available VINs: {available}")
-
-    def _call_with_reauth(self, func: callable):
-        """
-        Run func(), with 401/429 handling, transient payload retries,
-        and a circuit breaker that forces a full client re-init.
-        """
-        for attempt in range(3):
-            try:
-                return func()
-            except requests.exceptions.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
-                if code == 401:
-                    click.echo("BlueLink 401 ? reauth?")
-                    self.authenticate()
-                    continue
-                if code == 429:
-                    wait = 6 + attempt * 4
-                    click.echo(f"BlueLink 429 ? backoff {wait}s?")
-                    time.sleep(wait)
-                    continue
-                raise
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
-                # SDK saw an unexpected/missing field; treat as transient
-                self._bluelink_fail_count += 1
-                click.echo(f"BlueLink payload error ({type(e).__name__}): {e} "
-                      f"[fail#{self._bluelink_fail_count}]")
-
-                # short cooloff and try a normal reauth on first two hits
-                if self._bluelink_fail_count < self.cfg['bluelink_refresh_fail_count']:
-                    time.sleep(2 + attempt)
-                    try:
-                        self.authenticate()
-                    except Exception:
-                        pass
-                    continue
-
-                # circuit breaker: full client re-init on 3rd consecutive failure
-                self._full_reinit_bluelink()
-                # if we?re cooling off, don?t hammer
-                if time.time() < getattr(self, "_bluelink_cooloff_until", 0):
-                    time.sleep(max(0, self._bluelink_cooloff_until - time.time()))
-                # after re-init, one more try this loop:
-                try:
-                    return func()
-                finally:
-                    # reset fail counter after a re-init path
-                    self._bluelink_fail_count = 0
-            except Exception as e:
-                click.echo(f"BlueLink unexpected error: {e!r}. Retrying once?")
-                time.sleep(2)
-                continue
-
-        # Final attempt (let exceptions bubble if it still fails)
-        return func()
-
-    def _full_reinit_bluelink(self):
-        """Hard reset BlueLink by rebuilding VehicleManager exactly like authenticate()."""
-        click.echo("BlueLink: performing FULL client re-init?")
-        from hyundai_kia_connect_api import VehicleManager
-
-        # Recreate VehicleManager exactly as in authenticate()
-        vm = VehicleManager(
-            region=self.region_id,
-            brand=self.brand_id,
-            username=self.username,
-            password=self.password,
-            pin=self.pin
-        )
-        vm.check_and_refresh_token()
-
-        # Map VIN to internal id (support both .vin and .VIN)
-        vehicle_id = None
-        for internal_id, vehicle in vm.vehicles.items():
+    def _vehicle_id_for(self, manager):
+        for internal_id, vehicle in manager.vehicles.items():
             vehicle_vin = getattr(vehicle, "vin", getattr(vehicle, "VIN", None))
             if vehicle_vin == self.vin:
-                vehicle_id = internal_id
-                break
-        if vehicle_id is None:
-            available = [getattr(v, "vin", getattr(v, "VIN", None)) for v in vm.vehicles.values()]
-            raise RuntimeError(f"VIN '{self.vin}' not found after re-init; available VINs: {available}")
+                return internal_id
+        available = [
+            getattr(vehicle, "vin", getattr(vehicle, "VIN", None))
+            for vehicle in manager.vehicles.values()
+        ]
+        raise RuntimeError(f"VIN '{self.vin}' not found; available VINs: {available}")
 
-        # Atomically swap in the fresh manager + id
-        self.vm = vm
+    def authenticate(self):
+        manager = VehicleManager(
+            region=self.region_id,
+            brand=self.brand_id,
+            username=self.username,
+            password=self.password,
+            pin=self.pin,
+        )
+        manager.check_and_refresh_token()
+        vehicle_id = self._vehicle_id_for(manager)
+        self.vm = manager
         self.vehicle_id = vehicle_id
 
-        # Clear breaker / cooldown state
-        self._bluelink_fail_count = 0
-        self._bluelink_cooloff_until = 0
-        setattr(self, "_skip_next_refresh_until", 0)
-
-        click.echo("BlueLink: FULL re-init complete.")
+    def _full_reinit_bluelink(self):
+        click.echo("BlueLink: rebuilding client after repeated refresh failures")
+        self.authenticate()
 
     def _call_with_reauth(self, func: callable):
-        """
-        Run func(), with 401/429 handling, transient payload retries,
-        and a circuit breaker that forces a full client re-init.
-        """
+        """Run one API operation with token preflight and bounded retries."""
+        last_error = None
         for attempt in range(3):
             try:
+                self.vm.check_and_refresh_token()
                 return func()
-            except requests.exceptions.HTTPError as e:
-                code = getattr(e.response, "status_code", None)
-                if code == 401:
-                    click.echo("BlueLink 401 ? reauth?")
+            except requests.exceptions.HTTPError as exc:
+                last_error = exc
+                status = getattr(exc.response, "status_code", None)
+                if status in (401, 403):
+                    click.echo("BlueLink session rejected; authenticating again")
                     self.authenticate()
                     continue
-                if code == 429:
-                    wait = 6 + attempt * 4
-                    click.echo(f"BlueLink 429 ? backoff {wait}s?")
-                    time.sleep(wait)
+                if status == 429 or status in (500, 502, 503, 504):
+                    delay = 6 + attempt * 4
+                    click.echo(
+                        f"BlueLink transient HTTP {status}; retrying in {delay}s"
+                    )
+                    time.sleep(delay)
                     continue
                 raise
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as e:
-                self._bluelink_fail_count += 1
-                click.echo(f"BlueLink payload error ({type(e).__name__}): {e} [fail#{self._bluelink_fail_count}]")
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                last_error = exc
+                delay = 2 + attempt * 2
+                click.echo(f"BlueLink network error; retrying in {delay}s")
+                time.sleep(delay)
 
-                if self._bluelink_fail_count >= 1:
-                    click.echo("??  BlueLink circuit-breaker TRIPPED ? full re-init")
-                    self._full_reinit_bluelink()
-                    self._bluelink_fail_count = 0
-                    continue
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("BlueLink operation failed without an error")
 
-                time.sleep(2)
-                try:
-                    self.authenticate()
-                except Exception:
-                    pass
-                continue
+    def _status_from_vehicle(self) -> dict:
+        car = self.vm.get_vehicle(self.vehicle_id)
+        target_ac = getattr(car, "ev_charge_limits_ac", None)
+        target_dc = getattr(car, "ev_charge_limits_dc", None)
+        data = self._safe_vehicle_data(car)
+        charge_info = (
+            data.get("vehicleStatus", {})
+            .get("evStatus", {})
+            .get("reservChargeInfos", {})
+        )
+        for item in charge_info.get("targetSOClist", []) or []:
+            if item.get("plugType") == 0:
+                target_ac = item.get("targetSOClevel", target_ac)
+            elif item.get("plugType") == 1:
+                target_dc = item.get("targetSOClevel", target_dc)
+        return {
+            "plugged_in": bool(getattr(car, "ev_battery_is_plugged_in", False)),
+            "charging": bool(getattr(car, "ev_battery_is_charging", False)),
+            "soc": getattr(car, "ev_battery_percentage", None),
+            "target_ac": target_ac,
+            "target_dc": target_dc,
+            "charging_power_kW": getattr(car, "ev_charging_power", None),
+            "data_stale": False,
+            "data_age_seconds": 0,
+        }
 
-                # circuit breaker: full client re-init on 3rd consecutive failure
-                click.echo("??  BlueLink circuit-breaker TRIPPED ? full re-init")
-                self._full_reinit_bluelink()
-                # if we're cooling off, don't hammer
-                if time.time() < getattr(self, "_bluelink_cooloff_until", 0):
-                    time.sleep(max(0, self._bluelink_cooloff_until - time.time()))
-                # after re-init, one more try this loop:
-                try:
-                    return func()
-                finally:
-                    # reset fail counter after a re-init path
-                    self._bluelink_fail_count = 0
-            except Exception as e:
-                click.echo(f"BlueLink unexpected error: {e!r}. Retrying once?")
-                time.sleep(2)
-                continue
-
-        # Final attempt (let exceptions bubble if it still fails)
-        return func()
-            
-    def start_charge(self) -> dict:
-        """Tell the Hyundai Ioniq to begin charging immediately."""
+    def _refresh_status(self) -> dict:
         def _do():
-            token_obj = self.vm.api.login(self.username, self.password)
-            vehicle   = self.vm.get_vehicle(self.vehicle_id)
-            return self.vm.api.start_charge(token_obj, vehicle)
+            self.vm.update_vehicle_with_cached_state(self.vehicle_id)
+            return self._status_from_vehicle()
+
         return self._call_with_reauth(_do)
 
+    def _record_fresh_status(self, status, recovery_message=None):
+        if self._using_cached_status:
+            click.echo(recovery_message or "BlueLink live data recovered")
+        self._status_failure_count = 0
+        self._using_cached_status = False
+        self._last_good_status = dict(status)
+        self._last_good_status_at = time.time()
+        return status
+
+    def _cached_status(self, error):
+        if self._last_good_status is None:
+            raise error
+        if not self._using_cached_status:
+            click.echo(
+                f"BlueLink refresh unavailable ({type(error).__name__}: {error}); "
+                "using last-known-good data"
+            )
+        self._using_cached_status = True
+        status = dict(self._last_good_status)
+        status["data_stale"] = True
+        status["data_age_seconds"] = max(
+            0, int(time.time() - self._last_good_status_at)
+        )
+        return status
+
+    def get_vehicle_status(self) -> dict:
+        try:
+            return self._record_fresh_status(self._refresh_status())
+        except Exception as exc:
+            self._status_failure_count += 1
+            if self._status_failure_count >= self._reinit_failure_threshold:
+                try:
+                    self._full_reinit_bluelink()
+                    status = self._refresh_status()
+                    return self._record_fresh_status(
+                        status, "BlueLink live data recovered after client rebuild"
+                    )
+                except Exception as reinit_exc:
+                    exc = reinit_exc
+            return self._cached_status(exc)
+
+    def get_ac_target_soc(self) -> int | None:
+        """Read the AC target from the snapshot already fetched this cycle."""
+        vehicle = self.vm.get_vehicle(self.vehicle_id)
+        data = self._safe_vehicle_data(vehicle)
+        target_soc_list = (
+            data.get("vehicleStatus", {})
+            .get("evStatus", {})
+            .get("reservChargeInfos", {})
+            .get("targetSOClist", [])
+        )
+        for item in target_soc_list or []:
+            if item.get("plugType") == 0:
+                return item.get("targetSOClevel")
+        return getattr(vehicle, "ev_charge_limits_ac", None)
+
+    def start_charge(self) -> dict:
+        """Tell the Hyundai Ioniq to begin charging immediately."""
+        return self._call_with_reauth(
+            lambda: self.vm.api.start_charge(
+                self.vm.token, self.vm.get_vehicle(self.vehicle_id)
+            )
+        )
 
     def stop_charge(self) -> dict:
         """Tell the Hyundai Ioniq to stop charging immediately."""
-        def _do():
-            token_obj = self.vm.api.login(self.username, self.password)
-            vehicle   = self.vm.get_vehicle(self.vehicle_id)
-            return self.vm.api.stop_charge(token_obj, vehicle)
-        return self._call_with_reauth(_do)
-
-    def get_vehicle_status(self) -> dict:
-        def _do():
-            now = time.time()
-            can_refresh = now >= getattr(self, "_skip_next_refresh_until", 0)
-            if can_refresh:
-                try:
-                    self.vm.update_vehicle_with_cached_state(self.vehicle_id)
-                    self._refresh_fail_count = 0
-                except Exception as e:
-                    self._refresh_fail_count += 1
-                    click.echo(f"refresh failed: {e}. fail#{self._refresh_fail_count}. Cooling off 30s.")
-                    self._skip_next_refresh_until = now + 30
-                    if self._refresh_fail_count >= self.cfg['bluelink_refresh_fail_count']:
-                        click.echo("BlueLink refresh failures reached threshold ? full re-init")
-                        self._full_reinit_bluelink()
-                        self._refresh_fail_count = 0
-                        self.vm.update_vehicle_with_cached_state(self.vehicle_id)
-
-            car = self.vm.get_vehicle(self.vehicle_id)
-
-            target_ac = getattr(car, "ev_charge_limits_ac", None)
-            target_dc = getattr(car, "ev_charge_limits_dc", None)
-            charging_power_kW = getattr(car, "ev_charging_power", None)
-
-            #per-plug target list (robust against vehicle.data being a JSON string)
-            vd = self._safe_vehicle_data(car)
-            rci = vd.get("vehicleStatus", {}).get("evStatus", {}).get("reservChargeInfos", {})
-            for item in rci.get("targetSOClist", []) or []:
-                if item.get("plugType") == 0:
-                    target_ac = item.get("targetSOClevel", target_ac)
-                elif item.get("plugType") == 1:
-                    target_dc = item.get("targetSOClevel", target_dc)
-            return {
-                "plugged_in": bool(getattr(car, "ev_battery_is_plugged_in", False)),
-                "charging":   bool(getattr(car, "ev_battery_is_charging", False)),
-                "soc":        getattr(car, "ev_battery_percentage", None),
-                "target_ac":  target_ac,
-                "target_dc":  target_dc,
-                "charging_power_kW": charging_power_kW
-            }
-        return self._call_with_reauth(_do)
-
-    def get_ac_target_soc(self) -> int | None:
-        """
-        Return the AC charging target SOC percentage (or None if unavailable).
-        """
-        def _do():
-            # refresh cached state, then read
-            self.vm.update_vehicle_with_cached_state(self.vehicle_id)
-            vehicle = self.vm.get_vehicle(self.vehicle_id)
-
-            vd = self._safe_vehicle_data(vehicle)
-            try:
-                target_soc_list = vd["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
-                return next(item["targetSOClevel"] for item in target_soc_list if item.get("plugType") == 0)
-            except Exception:
-                # Fallback to top-level shortcut if the detailed list isn't present
-                return getattr(vehicle, "ev_charge_limits_ac", None)
-
-        return self._call_with_reauth(_do)
+        return self._call_with_reauth(
+            lambda: self.vm.api.stop_charge(
+                self.vm.token, self.vm.get_vehicle(self.vehicle_id)
+            )
+        )
 
     def set_ac_target_soc(self, soc_level: int) -> dict:
-        """
-        Set the AC charging target SOC percentage, preserving the current DC limit.
-        """
+        """Set AC charge limit while preserving the cached DC limit."""
         if not (50 <= soc_level <= 100):
             raise ValueError("SOC level must be between 50 and 100")
 
         def _do():
-            token_obj = self.vm.api.login(self.username, self.password)
             vehicle = self.vm.get_vehicle(self.vehicle_id)
-
-            # Read current DC target from vehicle data (robust to JSON string)
-            vd = self._safe_vehicle_data(vehicle)
-            target_soc_list = vd["vehicleStatus"]["evStatus"]["reservChargeInfos"]["targetSOClist"]
-            dc_limit = next(item["targetSOClevel"] for item in target_soc_list if item.get("plugType") == 1)
-
-            # set_charge_limits(api_token, vehicle_obj, ac_limit, dc_limit)
-            return self.vm.api.set_charge_limits(token_obj, vehicle, soc_level, dc_limit)
+            data = self._safe_vehicle_data(vehicle)
+            target_soc_list = (
+                data.get("vehicleStatus", {})
+                .get("evStatus", {})
+                .get("reservChargeInfos", {})
+                .get("targetSOClist", [])
+            )
+            dc_limit = next(
+                (
+                    item.get("targetSOClevel")
+                    for item in target_soc_list or []
+                    if item.get("plugType") == 1
+                ),
+                getattr(vehicle, "ev_charge_limits_dc", None),
+            )
+            if dc_limit is None:
+                raise ValueError("BlueLink DC charge limit is unavailable")
+            return self.vm.api.set_charge_limits(
+                self.vm.token, vehicle, soc_level, dc_limit
+            )
 
         return self._call_with_reauth(_do)
 
@@ -967,7 +891,9 @@ def start(ctx):
                 "battery_soc": readings.get("battery_soc"),
                 "ev_soc": ev_status.get("soc"),
                 "ev_charging": ev_status.get("charging"),
-                "ev_charging_power_kW": ev_status.get("charging_power_kW")
+                "ev_charging_power_kW": ev_status.get("charging_power_kW"),
+                "bluelink_data_stale": ev_status.get("data_stale", False),
+                "bluelink_data_age_seconds": ev_status.get("data_age_seconds", 0),
             })
             click.echo(f"Charger status: {charger_status}")
 

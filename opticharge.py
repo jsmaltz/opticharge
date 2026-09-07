@@ -524,6 +524,14 @@ class BlueLinkSensor:
 
 class WallboxCharger:
 
+    class APIError(RuntimeError):
+        """A Wallbox call failed after bounded recovery attempts."""
+
+    class CircuitOpen(APIError):
+        def __init__(self, retry_after: float):
+            self.retry_after = max(0.0, retry_after)
+            super().__init__(f"Wallbox circuit open for {self.retry_after:.0f}s")
+
     EVSE_STATUS_PLUGGED = {
         164, 165, 177, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189,
         193, 194, 195, 196, 209, 210
@@ -531,13 +539,33 @@ class WallboxCharger:
     EVSE_STATUS_NOT_PLUGGED = {0, 161, 162, 163}
 
 
-    def __init__(self, username: str, password: str):
-        self._rate_limit_until = 0  # UNIX ts until which we should not call Wallbox again
-        self.client = Wallbox(username, password)
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        request_timeout: float = 10.0,
+        jwt_token_drift: float = 120.0,
+        max_retries: int = 2,
+        retry_base_seconds: float = 1.0,
+        circuit_breaker_failures: int = 3,
+        circuit_breaker_seconds: float = 60.0,
+    ):
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+        self._max_retries = max(0, int(max_retries))
+        self._retry_base_seconds = max(0.0, float(retry_base_seconds))
+        self._circuit_breaker_failures = max(1, int(circuit_breaker_failures))
+        self._circuit_breaker_seconds = max(1.0, float(circuit_breaker_seconds))
+        self.client = Wallbox(
+            username,
+            password,
+            requestGetTimeout=float(request_timeout),
+            jwtTokenDrift=float(jwt_token_drift),
+        )
         self.charger_id = None  # defer until we can reliably fetch
         # Try once, but never crash if Wallbox isn't ready yet
         try:
-            self.client.authenticate()
+            self._authenticate()
             ids = self._call_with_reauth(self.client.getChargersList)
 #            ids = self.client.getChargersList()
             if ids:
@@ -557,100 +585,136 @@ class WallboxCharger:
         # Unknown/new code: be conservative (treat as NOT plugged)
         return False
 
+    def _retry_delay(self, attempt: int, retry_after=None) -> float:
+        if retry_after is not None:
+            try:
+                return max(0.0, min(float(retry_after), 60.0))
+            except (TypeError, ValueError):
+                pass
+        base = self._retry_base_seconds * (2 ** attempt)
+        return min(30.0, base + random.uniform(0.0, min(0.5, base / 4.0)))
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._circuit_breaker_failures:
+            self._circuit_open_until = time.time() + self._circuit_breaker_seconds
+            click.echo(
+                f"Wallbox circuit opened for {self._circuit_breaker_seconds:.0f}s "
+                f"after {self._consecutive_failures} failed calls"
+            )
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+    def _force_fresh_authentication(self) -> None:
+        """Discard JWT state so wallbox.authenticate() cannot return early."""
+        for attribute, value in (
+            ("jwtToken", ""),
+            ("jwtRefreshToken", ""),
+            ("jwtTokenTtl", 0),
+            ("jwtRefreshTokenTtl", 0),
+        ):
+            if hasattr(self.client, attribute):
+                setattr(self.client, attribute, value)
+        headers = getattr(self.client, "headers", None)
+        if isinstance(headers, dict):
+            headers.pop("Authorization", None)
+        self._authenticate()
+
+    def _authenticate(self) -> None:
+        for attempt in range(self._max_retries + 1):
+            try:
+                self.client.authenticate()
+                return
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as caught:
+                error = caught
+                retryable = True
+                status = None
+            except requests.exceptions.HTTPError as caught:
+                error = caught
+                status = getattr(caught.response, "status_code", None)
+                retryable = status == 429 or status in (500, 502, 503, 504)
+
+            if not retryable or attempt >= self._max_retries:
+                self._record_failure()
+                raise self.APIError(
+                    f"Wallbox authentication failed"
+                    + (f" with HTTP {status}" if status else "")
+                ) from error
+
+            retry_after = None
+            if status == 429 and getattr(error, "response", None) is not None:
+                retry_after = error.response.headers.get("Retry-After")
+            delay = self._retry_delay(attempt, retry_after)
+            click.echo(f"Wallbox authentication retry in {delay:.1f}s")
+            time.sleep(delay)
+
     def _ensure_session(self):
         """
         Ensure we are authenticated and have a charger_id.
         Called lazily by public methods so init failures don't kill the process.
         """
+        now = time.time()
+        if self._circuit_open_until > now:
+            raise self.CircuitOpen(self._circuit_open_until - now)
+
         # Authenticate if token missing/expired
-        try:
-            # authenticate() is idempotent in wallbox lib; call once here
-            self.client.authenticate()
-        except Exception as e:
-            # One short backoff + retry to ride out transient startup/network issues
-            click.echo(f"Wallbox auth failed, retrying shortly: {e!r}")
-            time.sleep(3)
-            self.client.authenticate()
+        self._authenticate()
 
         # Ensure we have a charger id
         if not self.charger_id:
-            ids = self.client.getChargersList()
+            ids = self._call_with_reauth(self.client.getChargersList)
             if not ids:
                 raise RuntimeError("No Wallbox chargers available after auth retry")
             self.charger_id = ids[0]
             click.echo(f"DEBUG: Available charger IDs: {ids}")
 
     def _call_with_reauth(self, func, *args, **kwargs):
-        import time
-        try:
-            # Respect any active rate-limit holdoff
-            now = time.time()
-            if getattr(self, "_rate_limit_until", 0) > now:
-                sleep_for = int(self._rate_limit_until - now)
-                if sleep_for > 0:
-                    click.echo(f"Wallbox rate limit holdoff: sleeping {sleep_for}s before calling {getattr(func, '__name__', 'call')}")
-                    time.sleep(sleep_for)
-            return func(*args, **kwargs)
+        now = time.time()
+        if self._circuit_open_until > now:
+            raise self.CircuitOpen(self._circuit_open_until - now)
 
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status in (401, 403):
-                click.echo("Wallbox session unauthorized. Re-authenticating...")
-                # Re-auth then retry once
-                self.client.authenticate()
-                return func(*args, **kwargs)
+        forced_auth = False
+        attempt = 0
+        while True:
+            try:
+                result = func(*args, **kwargs)
+                self._record_success()
+                return result
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as caught:
+                error = caught
+                status = None
+                retryable = True
+            except requests.exceptions.HTTPError as caught:
+                error = caught
+                status = getattr(caught.response, "status_code", None)
+                if status in (401, 403) and not forced_auth:
+                    click.echo("Wallbox session unauthorized; forcing fresh authentication")
+                    self._force_fresh_authentication()
+                    forced_auth = True
+                    continue
+                retryable = status == 429 or status in (500, 502, 503, 504)
 
-            if status == 429:
-                # Back off hard and set a holdoff window for subsequent ticks
-                backoff = 15
-                click.echo(f"Wallbox rate limit (429). Backing off {backoff}s and retrying once.")
-                time.sleep(backoff)
-                # Retry once after backoff
-                try:
-                    result = func(*args, **kwargs)
-                except requests.exceptions.HTTPError as e2:
-                    # If still 429, extend holdoff and re-raise to outer loop
-                    if getattr(e2.response, "status_code", None) == 429:
-                        self._rate_limit_until = time.time() + 60  # 1 minute holdoff
-                        click.echo("Wallbox 429 persists. Setting 60s holdoff for subsequent calls.")
-                    raise
-                else:
-                    # Success after backoff?clear holdoff window
-                    self._rate_limit_until = 0
-                    return result
+            if not retryable or attempt >= self._max_retries:
+                self._record_failure()
+                operation = getattr(func, "__name__", "API call")
+                raise self.APIError(
+                    f"Wallbox {operation} failed"
+                    + (f" with HTTP {status}" if status else "")
+                ) from error
 
-            # Not a handled code: bubble up
-            raise
-
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            click.echo(f"Wallbox network error: {e!r}. Backing off 3s and retrying?")
-            time.sleep(3)
-            # One retry after a short network backoff
-            return func(*args, **kwargs)
-
-    def _call_with_reauth_rem(self, func, *args, **kwargs):
-        """
-        Wrap a Wallbox API call with lightweight 401/429/connection retry.
-        """
-        try:
-            return func(*args, **kwargs)
-        except requests.exceptions.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status in (401, 403):
-                click.echo("Wallbox session unauthorized. Re-authenticating...")
-                self._ensure_session()
-                return func(*args, **kwargs)
-            if status == 429:
-                click.echo("Wallbox rate limit (429). Backing off 10s and retrying?")
-                time.sleep(10)
-                return func(*args, **kwargs)
-            raise
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout) as e:
-            click.echo(f"Wallbox network error: {e!r}. Backing off 3s and retrying?")
-            time.sleep(3)
-            self._ensure_session()
-            return func(*args, **kwargs)
+            retry_after = None
+            if status == 429 and getattr(error, "response", None) is not None:
+                retry_after = error.response.headers.get("Retry-After")
+            delay = self._retry_delay(attempt, retry_after)
+            click.echo(
+                f"Wallbox transient"
+                + (f" HTTP {status}" if status else " network error")
+                + f"; retrying in {delay:.1f}s"
+            )
+            time.sleep(delay)
+            attempt += 1
 
     def set_current(self, amps: int):
         """
@@ -773,7 +837,13 @@ def start(ctx):
         
     charger = WallboxCharger(
         username=cfg['wallbox_user'],
-        password=cfg['wallbox_pass']
+        password=cfg['wallbox_pass'],
+        request_timeout=cfg.get('wallbox_request_timeout_s', 10),
+        jwt_token_drift=cfg.get('wallbox_jwt_drift_s', 120),
+        max_retries=cfg.get('wallbox_max_retries', 2),
+        retry_base_seconds=cfg.get('wallbox_retry_base_s', 1),
+        circuit_breaker_failures=cfg.get('wallbox_circuit_breaker_failures', 3),
+        circuit_breaker_seconds=cfg.get('wallbox_circuit_breaker_s', 60),
     )
     engine = DecisionEngine(cfg)
     solar_forecast = SolarForecast(cfg)
@@ -1137,13 +1207,18 @@ def start(ctx):
 
         except Exception as e:
             consec_errors += 1
-            backoff = min(2 * consec_errors, max_backoff)
+            if isinstance(e, WallboxCharger.CircuitOpen):
+                backoff = min(max(1.0, e.retry_after), max_backoff)
+            else:
+                backoff = min(2 * consec_errors, max_backoff)
             # --- DIAGNOSTIC: show exact line and inputs causing the crash ---
             import traceback
             exc_type = type(e).__name__
-            print(f"Tick error ({exc_type}): {e!r}. Backing off 2s, then continuing.")
-            # Full stacktrace with file & line numbers
-            traceback.print_exc()
+            print(f"Tick error ({exc_type}): {e}. Backing off {backoff:.0f}s, then continuing.")
+            # Expected Wallbox outages are already classified and do not need a
+            # duplicated traceback. Preserve full diagnostics for other errors.
+            if not isinstance(e, WallboxCharger.APIError):
+                traceback.print_exc()
 
             # Dump the types and short previews of the loop inputs
             def _short(x, n=400):

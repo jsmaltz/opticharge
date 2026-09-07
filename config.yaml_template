@@ -33,6 +33,12 @@ vehicle_vin: ""
 wallbox_user: ""
 wallbox_pass: ""
 wallbox_region: "us"         # e.g. 'eu', 'us'
+wallbox_request_timeout_s: 10
+wallbox_jwt_drift_s: 120
+wallbox_max_retries: 2
+wallbox_retry_base_s: 1
+wallbox_circuit_breaker_failures: 3
+wallbox_circuit_breaker_s: 60
 
 # Polling & logging
 poll_interval: 300           # how often to poll sensors (in seconds)

@@ -14,6 +14,8 @@ back to grid.
 - **Vehicle re-auth** – automatic BlueLink reauthentication and retry on failure.
 - **Dynamic charging current ** – real-time adjustment to soak up surplus.
 - **Anti-thrash** – cooldown timers for start/stop and current changes.
+- **Wallbox recovery** – forced fresh login after rejected tokens, bounded
+  transient retries, request timeouts, and a circuit breaker.
 - **Solar forecasting** – optional Open-Meteo forecasts adjust the overnight EV
   target and Powerwall safety floor.
 

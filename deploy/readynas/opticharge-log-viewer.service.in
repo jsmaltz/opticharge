@@ -1,0 +1,19 @@
+[Unit]
+Description=OptiCharge intranet log viewer
+Wants=network-online.target
+After=network-online.target opticharge.service
+
+[Service]
+Type=simple
+WorkingDirectory=@APP_DIR@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@BASE_DIR@/venv/bin/python @APP_DIR@/log_viewer.py --host 0.0.0.0 --port 8088 --unit opticharge.service
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

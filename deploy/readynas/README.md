@@ -28,6 +28,7 @@ cp config.yaml_template config.yaml
 vi config.yaml
 sh deploy/readynas/install-runtime.sh
 systemctl start opticharge.service
+systemctl start opticharge-log-viewer.service
 ```
 
 For local Gateway deployments, set `tesla_data_source: local` and the
@@ -63,6 +64,7 @@ The update script:
 - installs pinned `requirements.txt` into the existing venv
 - runs `pip check` and Python syntax checks
 - restarts `opticharge.service`
+- installs and restarts `opticharge-log-viewer.service`
 
 It does not modify `config.yaml` and does not rebuild Python or OpenSSL.
 
@@ -73,6 +75,16 @@ systemctl status opticharge.service
 journalctl -u opticharge.service -f
 systemctl restart opticharge.service
 systemctl stop opticharge.service
+```
+
+The read-only intranet log viewer is available at
+`http://10.0.0.50:8088/`. It auto-refreshes a bounded portion of the systemd
+journal, shows controller service health, and accepts requests only from
+private, loopback, or link-local source addresses.
+
+```sh
+systemctl status opticharge-log-viewer.service
+journalctl -u opticharge-log-viewer.service -f
 ```
 
 ## Why this is not just apt install

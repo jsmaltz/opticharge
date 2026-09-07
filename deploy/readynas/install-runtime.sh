@@ -154,7 +154,7 @@ install_venv() {
     cd "$APP_DIR"
     "$VENV_DIR/bin/python" -m pip install -r requirements.txt
     "$VENV_DIR/bin/python" -m pip check
-    "$VENV_DIR/bin/python" -m py_compile opticharge.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
+    "$VENV_DIR/bin/python" -m py_compile opticharge.py log_viewer.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
 }
 
 install_service() {
@@ -165,8 +165,17 @@ install_service() {
     fi
     sed -e "s|@BASE_DIR@|$BASE_DIR|g" -e "s|@APP_DIR@|$APP_DIR|g" \
         "$service_template" > /etc/systemd/system/opticharge.service
+
+    log_service_template="$APP_DIR/deploy/readynas/opticharge-log-viewer.service.in"
+    if [ ! -f "$log_service_template" ]; then
+        echo "Missing service template: $log_service_template" >&2
+        exit 1
+    fi
+    sed -e "s|@BASE_DIR@|$BASE_DIR|g" -e "s|@APP_DIR@|$APP_DIR|g" \
+        "$log_service_template" > /etc/systemd/system/opticharge-log-viewer.service
     systemctl daemon-reload
     systemctl enable opticharge.service
+    systemctl enable opticharge-log-viewer.service
 }
 
 configure_archive_apt
@@ -180,3 +189,4 @@ apt-get check
 
 echo "ReadyNAS runtime installed."
 echo "Start with: systemctl start opticharge.service"
+echo "Start log viewer with: systemctl start opticharge-log-viewer.service"

@@ -5,6 +5,7 @@ BASE_DIR=${BASE_DIR:-/apps/opticharge}
 APP_DIR=${APP_DIR:-$BASE_DIR/app}
 VENV_DIR=${VENV_DIR:-$BASE_DIR/venv}
 SERVICE_NAME=${SERVICE_NAME:-opticharge.service}
+LOG_SERVICE_NAME=${LOG_SERVICE_NAME:-opticharge-log-viewer.service}
 REMOTE=${REMOTE:-origin}
 BRANCH=${BRANCH:-main}
 
@@ -39,11 +40,26 @@ new_head=$(git rev-parse --short HEAD)
 
 "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 "$VENV_DIR/bin/python" -m pip check
-"$VENV_DIR/bin/python" -m py_compile opticharge.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
+"$VENV_DIR/bin/python" -m py_compile opticharge.py log_viewer.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
+
+log_service_template="$APP_DIR/deploy/readynas/opticharge-log-viewer.service.in"
+if [ -f "$log_service_template" ]; then
+    sed -e "s|@BASE_DIR@|$BASE_DIR|g" -e "s|@APP_DIR@|$APP_DIR|g" \
+        "$log_service_template" > "/etc/systemd/system/$LOG_SERVICE_NAME"
+    systemctl daemon-reload
+    systemctl enable "$LOG_SERVICE_NAME"
+fi
 
 systemctl restart "$SERVICE_NAME"
+if [ -f "$log_service_template" ]; then
+    systemctl restart "$LOG_SERVICE_NAME"
+fi
 sleep 5
 systemctl is-active "$SERVICE_NAME"
+if [ -f "$log_service_template" ]; then
+    systemctl is-active "$LOG_SERVICE_NAME"
+fi
 
 echo "Updated $APP_DIR from $old_head to $new_head and restarted $SERVICE_NAME."
 echo "Watch logs with: journalctl -u $SERVICE_NAME -f"
+echo "Intranet log viewer: http://10.0.0.50:8088/"

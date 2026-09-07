@@ -121,3 +121,7 @@ service opticharge restart
 Show log:
 
 journalctl -u opticharge.service -f
+
+ReadyNAS intranet log viewer:
+
+http://10.0.0.50:8088/

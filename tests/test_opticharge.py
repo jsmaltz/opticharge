@@ -11,6 +11,7 @@ from opticharge import (
     _build_tesla_sensor,
     _command_charging_start,
     _command_charging_stop,
+    _evse_power_watts,
     _should_stop_charging,
 )
 
@@ -32,6 +33,20 @@ class DisabledTeslaSensorTests(unittest.TestCase):
 
         self.assertIsInstance(sensor, DisabledTeslaSensor)
         tesla_sensor.assert_not_called()
+
+
+class EvsePowerTests(unittest.TestCase):
+    def test_estimates_active_wallbox_power(self):
+        self.assertEqual(
+            _evse_power_watts({"charging": True, "current": 26}, {"voltage": 240}),
+            6240.0,
+        )
+
+    def test_reports_zero_when_not_charging(self):
+        self.assertEqual(
+            _evse_power_watts({"charging": False, "current": 26}, {"voltage": 240}),
+            0.0,
+        )
 
 
 def bare_bluelink(reinit_failures=3):

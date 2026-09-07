@@ -757,6 +757,17 @@ def _should_stop_charging(state, last_state, charging_evse, charging_bl):
     )
 
 
+def _evse_power_watts(charger_status, cfg) -> float:
+    """Estimate active EVSE power from the Wallbox current setting."""
+    try:
+        if charger_status.get("charging"):
+            amps = float(charger_status.get("current") or 0.0)
+            return amps * float(cfg.get("voltage", 240.0)) * float(cfg.get("pf", 1.0))
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return 0.0
+
+
 def _build_tesla_sensor(cfg):
     if not cfg.get("tesla_enabled", True):
         return DisabledTeslaSensor()
@@ -837,15 +848,6 @@ def start(ctx):
 
     target_soc = cfg['ev_target_soc']
 
-    def _evse_power_watts(charger_status, cfg) -> float:
-        try:
-            if charger_status.get("charging"):
-                amps = float(charger_status.get("current") or 0.0)
-                return amps * float(cfg.get("voltage", 240.0)) * float(cfg.get("pf", 1.0))
-        except Exception:
-            pass
-        return 0.0
-
     def _in_window(now, start_hour, end_hour):
         """Return True if now is within [start_hour → end_hour) with midnight wrap."""
         if start_hour <= end_hour:
@@ -885,13 +887,16 @@ def start(ctx):
                 except Exception: charger_status = {}
             if not isinstance(charger_status, dict):
                 charger_status = {}
+            evse_power_kw = round(_evse_power_watts(charger_status, cfg) / 1000.0, 2)
             click.echo({
                 "solar_power": readings["solar_power"],
                 "house_load": readings["house_load"],
                 "battery_soc": readings.get("battery_soc"),
                 "ev_soc": ev_status.get("soc"),
                 "ev_charging": ev_status.get("charging"),
-                "ev_charging_power_kW": ev_status.get("charging_power_kW"),
+                "ev_charging_power_kW": evse_power_kw,
+                "ev_charging_power_source": "wallbox_estimate",
+                "bluelink_ev_charging_power_kW": ev_status.get("charging_power_kW"),
                 "bluelink_data_stale": ev_status.get("data_stale", False),
                 "bluelink_data_age_seconds": ev_status.get("data_age_seconds", 0),
             })

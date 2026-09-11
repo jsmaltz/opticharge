@@ -322,9 +322,9 @@ class BlueLinkSensor:
             .get("reservChargeInfos", {})
         )
         for item in charge_info.get("targetSOClist", []) or []:
-            if item.get("plugType") == 0:
+            if item.get("plugType") == 1:
                 target_ac = item.get("targetSOClevel", target_ac)
-            elif item.get("plugType") == 1:
+            elif item.get("plugType") == 0:
                 target_dc = item.get("targetSOClevel", target_dc)
         return {
             "plugged_in": bool(getattr(car, "ev_battery_is_plugged_in", False)),
@@ -396,7 +396,7 @@ class BlueLinkSensor:
             .get("targetSOClist", [])
         )
         for item in target_soc_list or []:
-            if item.get("plugType") == 0:
+            if item.get("plugType") == 1:
                 return item.get("targetSOClevel")
         return getattr(vehicle, "ev_charge_limits_ac", None)
 
@@ -434,7 +434,7 @@ class BlueLinkSensor:
                 (
                     item.get("targetSOClevel")
                     for item in target_soc_list or []
-                    if item.get("plugType") == 1
+                    if item.get("plugType") == 0
                 ),
                 getattr(vehicle, "ev_charge_limits_dc", None),
             )

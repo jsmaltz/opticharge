@@ -87,7 +87,8 @@ class BlueLinkRefreshTests(unittest.TestCase):
                     "evStatus": {
                         "reservChargeInfos": {
                             "targetSOClist": [
-                                {"plugType": 0, "targetSOClevel": 80}
+                                {"plugType": 0, "targetSOClevel": 90},
+                                {"plugType": 1, "targetSOClevel": 80},
                             ]
                         }
                     }
@@ -101,6 +102,57 @@ class BlueLinkRefreshTests(unittest.TestCase):
 
         sensor.vm.update_vehicle_with_cached_state.assert_not_called()
         sensor.vm.check_and_refresh_token.assert_not_called()
+
+    def test_vehicle_status_maps_ac_and_dc_targets(self):
+        sensor = bare_bluelink()
+        vehicle = SimpleNamespace(
+            data={
+                "vehicleStatus": {
+                    "evStatus": {
+                        "reservChargeInfos": {
+                            "targetSOClist": [
+                                {"plugType": 0, "targetSOClevel": 90},
+                                {"plugType": 1, "targetSOClevel": 80},
+                            ]
+                        }
+                    }
+                }
+            },
+            ev_charge_limits_ac=70,
+            ev_charge_limits_dc=70,
+        )
+        sensor.vm.get_vehicle.return_value = vehicle
+
+        status = sensor._status_from_vehicle()
+
+        self.assertEqual(status["target_ac"], 80)
+        self.assertEqual(status["target_dc"], 90)
+
+    def test_set_ac_target_preserves_dc_target(self):
+        sensor = bare_bluelink()
+        vehicle = SimpleNamespace(
+            data={
+                "vehicleStatus": {
+                    "evStatus": {
+                        "reservChargeInfos": {
+                            "targetSOClist": [
+                                {"plugType": 0, "targetSOClevel": 90},
+                                {"plugType": 1, "targetSOClevel": 80},
+                            ]
+                        }
+                    }
+                }
+            },
+            ev_charge_limits_dc=70,
+        )
+        sensor.vm.get_vehicle.return_value = vehicle
+        sensor.vm.api.set_charge_limits.return_value = "ok"
+
+        self.assertEqual(sensor.set_ac_target_soc(100), "ok")
+
+        sensor.vm.api.set_charge_limits.assert_called_once_with(
+            sensor.vm.token, vehicle, 100, 90
+        )
 
     @patch("opticharge.time.time", return_value=1300.0)
     def test_partial_payload_returns_last_good_status_without_reinit(self, now):

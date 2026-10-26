@@ -448,6 +448,8 @@ class BlueLinkSensor:
 
 class WallboxCharger:
 
+    AUTH_URL = "https://api.wall-box.com/auth/token/user"
+
     class APIError(RuntimeError):
         """A Wallbox call failed after bounded recovery attempts."""
 
@@ -474,6 +476,9 @@ class WallboxCharger:
         circuit_breaker_failures: int = 3,
         circuit_breaker_seconds: float = 60.0,
     ):
+        self._username = username
+        self._password = password
+        self._request_timeout = float(request_timeout)
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
         self._max_retries = max(0, int(max_retries))
@@ -526,13 +531,14 @@ class WallboxCharger:
                 f"Wallbox circuit opened for {self._circuit_breaker_seconds:.0f}s "
                 f"after {self._consecutive_failures} failed calls"
             )
+            self._consecutive_failures = 0
 
     def _record_success(self) -> None:
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
 
     def _force_fresh_authentication(self) -> None:
-        """Discard JWT state so wallbox.authenticate() cannot return early."""
+        """Discard JWT state and obtain a fresh token from Wallbox."""
         for attribute, value in (
             ("jwtToken", ""),
             ("jwtRefreshToken", ""),
@@ -546,10 +552,46 @@ class WallboxCharger:
             headers.pop("Authorization", None)
         self._authenticate()
 
+    def _token_is_valid(self) -> bool:
+        token = getattr(self.client, "jwtToken", "")
+        try:
+            expires_at = float(getattr(self.client, "jwtTokenTtl", 0)) / 1000.0
+            drift = float(getattr(self.client, "jwtTokenDrift", 120.0))
+        except (TypeError, ValueError):
+            return False
+        return bool(token) and expires_at - drift > time.time()
+
+    def _request_token(self) -> None:
+        response = requests.post(
+            self.AUTH_URL,
+            auth=(self._username, self._password),
+            headers={
+                "Partner": "wallbox",
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json;charset=utf-8",
+            },
+            timeout=self._request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get("jwt") if isinstance(payload, dict) else None
+        ttl = payload.get("ttl") if isinstance(payload, dict) else None
+        if not token or ttl is None:
+            raise ValueError("Wallbox token response is missing jwt or ttl")
+
+        # wallbox 0.9.0 stores expiry timestamps as milliseconds.
+        self.client.jwtToken = token
+        self.client.jwtTokenTtl = int(ttl) * 1000
+        self.client.jwtRefreshToken = ""
+        self.client.jwtRefreshTokenTtl = 0
+        self.client.headers["Authorization"] = f"Bearer {token}"
+
     def _authenticate(self) -> None:
+        if self._token_is_valid():
+            return
         for attempt in range(self._max_retries + 1):
             try:
-                self.client.authenticate()
+                self._request_token()
                 return
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as caught:
                 error = caught
@@ -559,6 +601,10 @@ class WallboxCharger:
                 error = caught
                 status = getattr(caught.response, "status_code", None)
                 retryable = status == 429 or status in (500, 502, 503, 504)
+            except (TypeError, ValueError, KeyError) as caught:
+                error = caught
+                retryable = False
+                status = None
 
             if not retryable or attempt >= self._max_retries:
                 self._record_failure()

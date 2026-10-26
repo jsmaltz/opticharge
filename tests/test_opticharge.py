@@ -203,6 +203,9 @@ def http_error(status, retry_after=None):
 
 def bare_charger(max_retries=2, breaker_failures=3):
     charger = object.__new__(WallboxCharger)
+    charger._username = "user@example.com"
+    charger._password = "password"
+    charger._request_timeout = 10.0
     charger.client = Mock()
     charger.client.jwtToken = "rejected-token"
     charger.client.jwtRefreshToken = "refresh-token"
@@ -219,31 +222,58 @@ def bare_charger(max_retries=2, breaker_failures=3):
 
 
 class WallboxHardeningTests(unittest.TestCase):
+    @staticmethod
+    def token_response(token="fresh-token", ttl=2000):
+        response = Mock()
+        response.json.return_value = {"jwt": token, "ttl": ttl}
+        return response
+
+    @patch("opticharge.requests.post")
     @patch("opticharge.Wallbox")
-    def test_constructor_sets_timeout_and_proactive_token_drift(self, wallbox):
+    def test_constructor_sets_timeout_and_uses_current_auth_endpoint(self, wallbox, post):
         client = wallbox.return_value
+        client.jwtToken = ""
+        client.jwtTokenTtl = 0
+        client.jwtTokenDrift = 120
+        client.headers = {}
         client.getChargersList.return_value = [123]
+        post.return_value = self.token_response()
 
         charger = WallboxCharger("user", "password")
 
         wallbox.assert_called_once_with(
             "user", "password", requestGetTimeout=10.0, jwtTokenDrift=120.0
         )
+        post.assert_called_once_with(
+            WallboxCharger.AUTH_URL,
+            auth=("user", "password"),
+            headers={
+                "Partner": "wallbox",
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json;charset=utf-8",
+            },
+            timeout=10.0,
+        )
+        self.assertEqual(client.headers["Authorization"], "Bearer fresh-token")
         self.assertEqual(charger.charger_id, 123)
 
+    @patch("opticharge.requests.post")
     @patch("opticharge.time.sleep")
-    def test_401_discards_rejected_token_and_performs_fresh_login(self, sleep):
+    def test_401_discards_rejected_token_and_performs_fresh_login(self, sleep, post):
         charger = bare_charger()
         operation = Mock(side_effect=[http_error(401), {"status_id": 194}])
+        post.return_value = self.token_response(token="replacement-token")
 
         result = charger._call_with_reauth(operation)
 
         self.assertEqual(result, {"status_id": 194})
         self.assertEqual(operation.call_count, 2)
-        charger.client.authenticate.assert_called_once_with()
-        self.assertEqual(charger.client.jwtToken, "")
+        post.assert_called_once()
+        self.assertEqual(charger.client.jwtToken, "replacement-token")
         self.assertEqual(charger.client.jwtRefreshToken, "")
-        self.assertNotIn("Authorization", charger.client.headers)
+        self.assertEqual(
+            charger.client.headers["Authorization"], "Bearer replacement-token"
+        )
         sleep.assert_not_called()
 
     @patch("opticharge.random.uniform", return_value=0.0)
@@ -290,15 +320,26 @@ class WallboxHardeningTests(unittest.TestCase):
             charger._call_with_reauth(operation)
         self.assertEqual(operation.call_count, 3)
 
+    @patch("opticharge.requests.post")
     @patch("opticharge.time.time", return_value=1000.0)
-    def test_open_circuit_blocks_authentication_attempt(self, now):
+    def test_open_circuit_blocks_authentication_attempt(self, now, post):
         charger = bare_charger()
         charger._circuit_open_until = 1030.0
 
         with self.assertRaises(WallboxCharger.CircuitOpen):
             charger._ensure_session()
 
-        charger.client.authenticate.assert_not_called()
+        post.assert_not_called()
+
+    @patch("opticharge.time.time", return_value=1000.0)
+    def test_circuit_failure_count_resets_when_opened(self, now):
+        charger = bare_charger(max_retries=0, breaker_failures=3)
+
+        for _ in range(3):
+            charger._record_failure()
+
+        self.assertEqual(charger._consecutive_failures, 0)
+        self.assertEqual(charger._circuit_open_until, 1060.0)
 
     def test_pause_and_resume_use_hardened_api_wrapper(self):
         charger = bare_charger()

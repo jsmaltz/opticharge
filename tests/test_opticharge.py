@@ -276,6 +276,18 @@ class WallboxHardeningTests(unittest.TestCase):
         )
         sleep.assert_not_called()
 
+    @patch("opticharge.requests.post")
+    def test_403_control_rejection_does_not_trigger_reauthentication(self, post):
+        charger = bare_charger(max_retries=0)
+        operation = Mock(side_effect=http_error(403))
+
+        with self.assertRaisesRegex(
+            WallboxCharger.APIError, "failed with HTTP 403"
+        ):
+            charger._call_with_reauth(operation)
+
+        post.assert_not_called()
+
     @patch("opticharge.random.uniform", return_value=0.0)
     @patch("opticharge.time.sleep")
     def test_502_is_retried_with_bounded_backoff(self, sleep, uniform):
@@ -374,18 +386,40 @@ class ChargingCommandTests(unittest.TestCase):
         bluelink.set_ac_target_soc.assert_called_once_with(60)
         bluelink.start_charge.assert_called_once_with()
 
-    def test_stop_suspends_both_paths_even_when_telemetry_was_idle(self):
+    def test_idle_stop_state_does_not_send_redundant_stop_commands(self):
         charger = Mock()
         bluelink = Mock()
 
         self.assertTrue(
             _should_stop_charging("WAIT_POWERWALL", "CHARGING_GRID", False, False)
         )
-        _command_charging_stop(charger, bluelink, 9)
+        _command_charging_stop(
+            charger,
+            bluelink,
+            9,
+            charging_evse=False,
+            charging_bl=False,
+        )
+
+        charger.pause_charging.assert_not_called()
+        charger.set_current.assert_called_once_with(9)
+        bluelink.stop_charge.assert_not_called()
+
+    def test_stop_targets_only_active_charging_paths(self):
+        charger = Mock()
+        bluelink = Mock()
+
+        _command_charging_stop(
+            charger,
+            bluelink,
+            9,
+            charging_evse=True,
+            charging_bl=False,
+        )
 
         charger.pause_charging.assert_called_once_with()
         charger.set_current.assert_called_once_with(9)
-        bluelink.stop_charge.assert_called_once_with()
+        bluelink.stop_charge.assert_not_called()
 
     def test_unchanged_idle_stop_state_does_not_repeat_commands(self):
         self.assertFalse(
@@ -403,7 +437,13 @@ class ChargingCommandTests(unittest.TestCase):
         charger.pause_charging.side_effect = RuntimeError("wallbox unavailable")
 
         with self.assertRaisesRegex(RuntimeError, "wallbox unavailable"):
-            _command_charging_stop(charger, bluelink, 9)
+            _command_charging_stop(
+                charger,
+                bluelink,
+                9,
+                charging_evse=True,
+                charging_bl=True,
+            )
 
         charger.set_current.assert_called_once_with(9)
         bluelink.stop_charge.assert_called_once_with()

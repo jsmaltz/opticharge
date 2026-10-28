@@ -659,7 +659,7 @@ class WallboxCharger:
             except requests.exceptions.HTTPError as caught:
                 error = caught
                 status = getattr(caught.response, "status_code", None)
-                if status in (401, 403) and not forced_auth:
+                if status == 401 and not forced_auth:
                     click.echo("Wallbox session unauthorized; forcing fresh authentication")
                     self._force_fresh_authentication()
                     forced_auth = True
@@ -777,14 +777,24 @@ def _command_charging_start(charger, bluelink, ev_status, desired_target):
     bluelink.start_charge()
 
 
-def _command_charging_stop(charger, bluelink, default_amps):
-    """Fail closed by suspending both charging paths regardless of telemetry."""
+def _command_charging_stop(
+    charger,
+    bluelink,
+    default_amps,
+    *,
+    charging_evse,
+    charging_bl,
+):
+    """Stop only charging paths that telemetry reports as active."""
     errors = []
-    for operation in (
-        charger.pause_charging,
-        lambda: charger.set_current(default_amps),
-        bluelink.stop_charge,
-    ):
+    operations = []
+    if charging_evse:
+        operations.append(charger.pause_charging)
+    operations.append(lambda: charger.set_current(default_amps))
+    if charging_bl:
+        operations.append(bluelink.stop_charge)
+
+    for operation in operations:
         try:
             operation()
         except Exception as exc:
@@ -1163,6 +1173,9 @@ def start(ctx):
                     state = "WAIT_SOLAR"; amps_wanted = None; reason = "outside grid window (safety)"
 
                 state_changed = state != last_state
+                # Record the decision before any external command. If one command
+                # fails, the next tick retries only when charging is still active.
+                last_state = state
                 if state in ("CHARGING_GRID", "CHARGING_SOLAR"):
                     if amps_wanted is None:
                         # final belt & suspenders
@@ -1198,7 +1211,11 @@ def start(ctx):
                     )
                     if should_stop:
                         _command_charging_stop(
-                            charger, bluelink, cfg["default_amps"]
+                            charger,
+                            bluelink,
+                            cfg["default_amps"],
+                            charging_evse=charging_evse,
+                            charging_bl=charging_bl,
                         )
                         click.echo("Charging suspended")
                         last_startstop_ts = now_ts
@@ -1206,8 +1223,6 @@ def start(ctx):
                         last_set_current = cfg["default_amps"]
 
                 # UNPLUGGED or anything else → no action
-                last_state = state
-
             else:
                 click.echo("Vehicle not plugged in; skipping")
             consec_errors = 0

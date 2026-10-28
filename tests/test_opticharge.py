@@ -390,7 +390,7 @@ class ChargingCommandTests(unittest.TestCase):
         charger = Mock()
         bluelink = Mock()
 
-        self.assertTrue(
+        self.assertFalse(
             _should_stop_charging("WAIT_POWERWALL", "CHARGING_GRID", False, False)
         )
         _command_charging_stop(
@@ -402,7 +402,7 @@ class ChargingCommandTests(unittest.TestCase):
         )
 
         charger.pause_charging.assert_not_called()
-        charger.set_current.assert_called_once_with(9)
+        charger.set_current.assert_not_called()
         bluelink.stop_charge.assert_not_called()
 
     def test_stop_targets_only_active_charging_paths(self):

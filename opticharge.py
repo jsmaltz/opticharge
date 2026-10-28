@@ -790,7 +790,7 @@ def _command_charging_stop(
     operations = []
     if charging_evse:
         operations.append(charger.pause_charging)
-    operations.append(lambda: charger.set_current(default_amps))
+        operations.append(lambda: charger.set_current(default_amps))
     if charging_bl:
         operations.append(bluelink.stop_charge)
 
@@ -807,10 +807,8 @@ STOP_CHARGE_STATES = ("TARGET_REACHED", "WAIT_SOLAR", "WAIT_POWERWALL")
 
 
 def _should_stop_charging(state, last_state, charging_evse, charging_bl):
-    """Stop on entry to a safe state, or immediately if charging reappears."""
-    return state in STOP_CHARGE_STATES and (
-        state != last_state or charging_evse or charging_bl
-    )
+    """Stop only when a safe state still has an active charging path."""
+    return state in STOP_CHARGE_STATES and (charging_evse or charging_bl)
 
 
 def _evse_power_watts(charger_status, cfg) -> float:
@@ -1204,8 +1202,8 @@ def start(ctx):
                             click.echo("Skip start_charge: EVSE not connected")
 
                 elif state in STOP_CHARGE_STATES:
-                    # Act on entry even if both APIs currently say idle. This clears
-                    # a previously accepted start that the vehicle may execute later.
+                    # Do not send stop commands to an already-idle charger or car.
+                    # If a delayed start appears, active telemetry triggers a stop.
                     should_stop = _should_stop_charging(
                         state, last_state, charging_evse, charging_bl
                     )

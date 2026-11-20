@@ -990,8 +990,6 @@ def start(ctx):
 
                 overnight_target = overnight_plan.ev_target_soc
                 powerwall_floor = overnight_plan.powerwall_floor_soc
-                powerwall_stop_margin = float(cfg.get("grid_powerwall_stop_margin_soc", 2))
-                powerwall_stop_at = powerwall_floor + powerwall_stop_margin
                 desired_target = overnight_target if in_grid_window else cfg["ev_target_soc"]
                 surplus_target = cfg.get("ev_target_soc_solar_surplus", desired_target)
                 battery_ready = (not tesla_enabled) or (
@@ -1055,23 +1053,14 @@ def start(ctx):
                         except Exception:
                             grid_amps = cfg["max_amps"]
 
+                # Overnight grid charging is independent of Powerwall SOC.
+                # Solar-only charging retains its separate battery guards.
                 # state resolution
                 
                 if not plugged:
                     state = "UNPLUGGED"; amps_wanted = None; reason = "car not plugged"
                 elif target_reached:
                     state = "TARGET_REACHED"; amps_wanted = None; reason = "target met"
-                elif (
-                    tesla_enabled
-                    and in_grid_window
-                    and batt_soc is not None
-                    and batt_soc <= powerwall_stop_at
-                ):
-                    state = "WAIT_POWERWALL"; amps_wanted = None
-                    reason = (
-                        f"PW SOC {batt_soc:.1f}% reached {powerwall_floor:.1f}% "
-                        f"floor guard"
-                    )
                 elif in_grid_window and grid_amps:
                     state = "CHARGING_GRID"; amps_wanted = grid_amps; reason = "grid window"
                 # To avoid thrash, if the Powerwall has fallen past the low level, stop charging the EV

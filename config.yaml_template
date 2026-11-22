@@ -40,6 +40,27 @@ wallbox_retry_base_s: 1
 wallbox_circuit_breaker_failures: 3
 wallbox_circuit_breaker_s: 60
 
+# Home Assistant / Ecobee hybrid heat control. Start in dry-run mode and review
+# logs before allowing OptiCharge to change the auxiliary-heat-only switch.
+ecobee_control_enabled: false
+ecobee_dry_run: true
+home_assistant_url: "http://10.0.0.52:8123"
+home_assistant_token_file: ".home-assistant-token"
+home_assistant_timeout_s: 10
+ecobee_climate_entity_id: "climate.hallway_my_ecobee"
+ecobee_aux_heat_entity_id: "switch.hallway_my_ecobee_auxiliary_heat_only"
+ecobee_electricity_peak_rate_per_kwh: null
+ecobee_electricity_offpeak_rate_per_kwh: null
+ecobee_gas_rate_per_therm: null
+ecobee_heat_pump_cop: 3.0
+ecobee_furnace_efficiency: 0.95
+ecobee_cost_margin_fraction: 0.10
+ecobee_battery_limited_soc: 55
+ecobee_battery_hysteresis_soc: 5
+ecobee_solar_surplus_threshold_w: 500
+ecobee_solar_hysteresis_w: 500
+ecobee_min_dwell_minutes: 30
+
 # Polling & logging
 poll_interval: 300           # how often to poll sensors (in seconds)
 log_level: "INFO"            # DEBUG, INFO, WARNING, ERROR

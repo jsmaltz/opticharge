@@ -3,6 +3,12 @@
 OptiCharge is a Python script to intelligently control EV charging via a supported wallbox charger and the Hyundai BlueLink API.  
 It adjusts charging current in real-time based on **solar surplus**, **battery SOC**, and **time-of-day grid charging windows**.
 
+It can also integrate with an Ecobee thermostat through Home Assistant to
+select gas auxiliary heat when delivered gas heat is cheaper, Powerwall energy
+is limited, the EV is below target, solar is scarce, and heat is being called.
+The thermostat controller defaults to dry-run mode and applies a minimum dwell
+time before any mode change.
+
 The intention is to use all available solar, minimizing amount sent
 back to grid.
 
@@ -113,6 +119,19 @@ refresh tokens rotate; deploy this file with `config.yaml` and keep both files
 private. The North America API URL is the default. Accounts in Europe, the
 Middle East, or Africa must use the corresponding regional URL from Tesla's
 Fleet API documentation.
+
+## Home Assistant / Ecobee
+
+Create a dedicated non-administrator Home Assistant user and a long-lived
+access token for it. Store the token by itself in `.home-assistant-token` beside
+`config.yaml`, with file mode `0600`; do not put the token in Git or directly in
+the YAML file. Configure the Home Assistant URL and the Ecobee climate and
+auxiliary-heat entity IDs using the `ecobee_*` settings in
+`config.yaml_template`.
+
+Keep `ecobee_dry_run: true` until the peak/off-peak electricity rates, gas rate,
+heat-pump COP, and furnace efficiency have been verified in the logs. OptiCharge
+will not make a thermostat decision when required rate values are missing.
 
 Fedora:
 

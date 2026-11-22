@@ -22,6 +22,7 @@ from pathlib import Path
 from tesla_fleet import DEFAULT_API_BASE_URL, DEFAULT_TOKEN_URL, TeslaSensor
 from tesla_local import sensor_from_config as local_tesla_sensor_from_config
 from solar_forecast import SolarForecast
+from ecobee_control import EcobeeController
 # Turn on low-level HTTP debug logging
 #http_client.HTTPConnection.debuglevel = 1
 #logging.basicConfig(level=logging.DEBUG)
@@ -891,6 +892,13 @@ def start(ctx):
     )
     engine = DecisionEngine(cfg)
     solar_forecast = SolarForecast(cfg)
+    ecobee = None
+    if cfg.get("ecobee_control_enabled", False):
+        ecobee = EcobeeController.from_config(cfg)
+        click.echo(
+            "Ecobee control enabled"
+            + (" (dry run)" if ecobee.dry_run else "")
+        )
     interval = cfg.get('poll_interval', 300)
     last_state = None
     last_cmd_ts = 0.0
@@ -1212,6 +1220,23 @@ def start(ctx):
                 # UNPLUGGED or anything else → no action
             else:
                 click.echo("Vehicle not plugged in; skipping")
+
+            if ecobee is not None:
+                try:
+                    ecobee_result = ecobee.tick(
+                        readings=readings,
+                        ev_status=ev_status,
+                        ev_target=float(cfg["ev_target_soc"]),
+                        in_grid_window=_in_window(
+                            datetime.now(),
+                            cfg["grid_charge_start_hour"],
+                            cfg["grid_charge_end_hour"],
+                        ),
+                    )
+                    click.echo({"ecobee": ecobee_result})
+                except Exception as exc:
+                    # Thermostat control must never interrupt EV charging.
+                    click.echo(f"Ecobee control unavailable: {type(exc).__name__}: {exc}")
             consec_errors = 0
 
         except KeyboardInterrupt:

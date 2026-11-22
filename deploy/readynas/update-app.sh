@@ -40,7 +40,7 @@ new_head=$(git rev-parse --short HEAD)
 
 "$VENV_DIR/bin/python" -m pip install -r requirements.txt
 "$VENV_DIR/bin/python" -m pip check
-"$VENV_DIR/bin/python" -m py_compile opticharge.py log_viewer.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
+"$VENV_DIR/bin/python" -m py_compile opticharge.py ecobee_control.py log_viewer.py solar_forecast.py readteslaonly.py tesla_fleet.py tesla_local.py tesla_local_password.py tesla_auth.py tesla_diagnose.py
 
 log_service_template="$APP_DIR/deploy/readynas/opticharge-log-viewer.service.in"
 if [ -f "$log_service_template" ]; then

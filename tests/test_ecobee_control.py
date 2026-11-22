@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import Mock
 
 from ecobee_control import EcobeeController, HomeAssistantClient, decide_aux_heat
@@ -113,6 +114,38 @@ class ClientTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_ev2a_selects_winter_partial_peak_rate(self):
+        cfg = {
+            "ecobee_climate_entity_id": "climate.hallway",
+            "ecobee_aux_heat_entity_id": "switch.aux",
+            "ecobee_electric_rate_plan": "EV2-A",
+            "ecobee_ev2a_winter_partial_peak_rate_per_kwh": 0.39428,
+        }
+        controller = EcobeeController(cfg, Mock())
+
+        rate, period = controller._electricity_rate(
+            False, datetime(2026, 11, 22, 21, 30)
+        )
+
+        self.assertEqual(rate, 0.39428)
+        self.assertEqual(period, "winter_partial_peak")
+
+    def test_ev2a_selects_summer_offpeak_rate(self):
+        cfg = {
+            "ecobee_climate_entity_id": "climate.hallway",
+            "ecobee_aux_heat_entity_id": "switch.aux",
+            "ecobee_electric_rate_plan": "EV2-A",
+            "ecobee_ev2a_summer_offpeak_rate_per_kwh": 0.22558,
+        }
+        controller = EcobeeController(cfg, Mock())
+
+        rate, period = controller._electricity_rate(
+            False, datetime(2026, 7, 1, 14, 30)
+        )
+
+        self.assertEqual(rate, 0.22558)
+        self.assertEqual(period, "summer_offpeak")
+
     def test_dry_run_reports_action_without_calling_service(self):
         client = Mock()
         client.get_state.side_effect = [

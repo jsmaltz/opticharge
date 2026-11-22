@@ -79,6 +79,7 @@ class HeatingDecision:
     reason: str
     electric_heat_cost_per_kwh: float | None = None
     gas_heat_cost_per_kwh: float | None = None
+    electricity_rate_per_kwh: float | None = None
     heat_call: bool = False
     battery_limited: bool = False
     ev_needs_charge: bool = False
@@ -165,6 +166,7 @@ def decide_aux_heat(
         reason,
         electric_heat_cost_per_kwh=round(electric_cost, 4),
         gas_heat_cost_per_kwh=round(gas_cost, 4),
+        electricity_rate_per_kwh=round(electricity_rate, 5),
         heat_call=heat_call,
         battery_limited=battery_limited,
         ev_needs_charge=ev_needs_charge,
@@ -206,13 +208,34 @@ class EcobeeController:
         except (TypeError, ValueError):
             return float("inf")
 
-    def _electricity_rate(self, in_grid_window: bool) -> float | None:
+    def _electricity_rate(
+        self, in_grid_window: bool, now: datetime | None = None
+    ) -> tuple[float | None, str]:
+        now = now or datetime.now().astimezone()
+        if str(self.cfg.get("ecobee_electric_rate_plan", "")).upper() in {
+            "EV2-A",
+            "EV2A",
+        }:
+            hour = now.hour
+            if 16 <= hour < 21:
+                period = "peak"
+            elif 15 <= hour < 16 or 21 <= hour < 24:
+                period = "partial_peak"
+            else:
+                period = "offpeak"
+            season = "summer" if 6 <= now.month <= 9 else "winter"
+            value = self.cfg.get(f"ecobee_ev2a_{season}_{period}_rate_per_kwh")
+            return value, f"{season}_{period}"
         key = (
             "ecobee_electricity_offpeak_rate_per_kwh"
             if in_grid_window
             else "ecobee_electricity_peak_rate_per_kwh"
         )
-        return self.cfg.get(key, self.cfg.get("ecobee_electricity_rate_per_kwh"))
+        period = "offpeak" if in_grid_window else "peak"
+        return (
+            self.cfg.get(key, self.cfg.get("ecobee_electricity_rate_per_kwh")),
+            period,
+        )
 
     def tick(
         self,
@@ -221,6 +244,7 @@ class EcobeeController:
         ev_status: dict[str, Any],
         ev_target: float,
         in_grid_window: bool,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         climate = self.client.get_state(self.climate_entity)
         aux = self.client.get_state(self.aux_entity)
@@ -229,9 +253,10 @@ class EcobeeController:
         solar_surplus = float(readings.get("solar_power") or 0.0) - float(
             readings.get("house_load") or 0.0
         )
+        electricity_rate, rate_period = self._electricity_rate(in_grid_window, now)
         decision = decide_aux_heat(
             self.cfg,
-            electricity_rate=self._electricity_rate(in_grid_window),
+            electricity_rate=electricity_rate,
             battery_soc=readings.get("battery_soc"),
             ev_soc=ev_status.get("soc"),
             ev_target=ev_target,
@@ -245,6 +270,7 @@ class EcobeeController:
                 "current_aux_heat": current_aux,
                 "dry_run": self.dry_run,
                 "action": "none",
+                "electric_rate_period": rate_period,
             }
         )
         desired = decision.desired_aux_heat

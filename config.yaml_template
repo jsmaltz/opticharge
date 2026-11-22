@@ -49,11 +49,20 @@ home_assistant_token_file: ".home-assistant-token"
 home_assistant_timeout_s: 10
 ecobee_climate_entity_id: "climate.hallway_my_ecobee"
 ecobee_aux_heat_entity_id: "switch.hallway_my_ecobee_auxiliary_heat_only"
+# PG&E EV2-A tariff effective June 1, 2026. Check the current tariff before
+# deploying elsewhere or after a PG&E rate revision.
+ecobee_electric_rate_plan: "EV2-A"
+ecobee_ev2a_summer_peak_rate_per_kwh: 0.53809
+ecobee_ev2a_summer_partial_peak_rate_per_kwh: 0.42760
+ecobee_ev2a_summer_offpeak_rate_per_kwh: 0.22558
+ecobee_ev2a_winter_peak_rate_per_kwh: 0.41099
+ecobee_ev2a_winter_partial_peak_rate_per_kwh: 0.39428
+ecobee_ev2a_winter_offpeak_rate_per_kwh: 0.22558
 ecobee_electricity_peak_rate_per_kwh: null
 ecobee_electricity_offpeak_rate_per_kwh: null
-ecobee_gas_rate_per_therm: null
+ecobee_gas_rate_per_therm: 2.53545
 ecobee_heat_pump_cop: 3.0
-ecobee_furnace_efficiency: 0.95
+ecobee_furnace_efficiency: 0.92
 ecobee_cost_margin_fraction: 0.10
 ecobee_battery_limited_soc: 55
 ecobee_battery_hysteresis_soc: 5

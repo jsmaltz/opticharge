@@ -2,7 +2,13 @@ import unittest
 from datetime import datetime
 from unittest.mock import Mock
 
-from ecobee_control import EcobeeController, HomeAssistantClient, decide_aux_heat
+from ecobee_control import (
+    EcobeeController,
+    HomeAssistantError,
+    HomeAssistantClient,
+    decide_aux_heat,
+    heat_pump_cop,
+)
 
 
 BASE_CONFIG = {
@@ -18,6 +24,33 @@ BASE_CONFIG = {
 
 
 class DecisionTests(unittest.TestCase):
+    def test_interpolates_heat_pump_cop_from_outdoor_temperature(self):
+        cfg = {
+            "ecobee_heat_pump_cop": 3.0,
+            "ecobee_heat_pump_cop_curve": [
+                {"temperature_f": 5, "cop": 1.75},
+                {"temperature_f": 47, "cop": 3.54},
+            ],
+        }
+
+        self.assertAlmostEqual(heat_pump_cop(cfg, 26), 2.645)
+        self.assertEqual(heat_pump_cop(cfg, -5), 1.75)
+        self.assertEqual(heat_pump_cop(cfg, 60), 3.54)
+
+    def test_fixed_cop_is_used_without_weather(self):
+        self.assertEqual(heat_pump_cop(BASE_CONFIG, None), 3.0)
+
+    def test_invalid_curve_uses_fixed_cop(self):
+        cfg = {
+            "ecobee_heat_pump_cop": 2.9,
+            "ecobee_heat_pump_cop_curve": [
+                {"temperature_f": 5, "cop": 1.75},
+                {"temperature_f": 5, "cop": 1.9},
+            ],
+        }
+
+        self.assertEqual(heat_pump_cop(cfg, 5), 2.9)
+
     def test_uses_gas_when_all_priority_conditions_are_true(self):
         decision = decide_aux_heat(
             BASE_CONFIG,
@@ -115,6 +148,32 @@ class ClientTests(unittest.TestCase):
 
 
 class ControllerTests(unittest.TestCase):
+    def test_weather_failure_uses_fixed_cop(self):
+        client = Mock()
+        client.get_state.side_effect = [
+            {"attributes": {"hvac_action": "heating"}},
+            {"state": "off", "last_changed": "2020-01-01T00:00:00+00:00"},
+            HomeAssistantError("weather unavailable"),
+        ]
+        cfg = dict(
+            BASE_CONFIG,
+            ecobee_climate_entity_id="climate.hallway",
+            ecobee_aux_heat_entity_id="switch.aux",
+            ecobee_weather_entity_id="weather.hallway",
+            ecobee_dry_run=True,
+            ecobee_electricity_peak_rate_per_kwh=0.60,
+        )
+
+        result = EcobeeController(cfg, client).tick(
+            readings={"solar_power": 0, "house_load": 1000, "battery_soc": 40},
+            ev_status={"soc": 50},
+            ev_target=80,
+            in_grid_window=False,
+        )
+
+        self.assertIsNone(result["outdoor_temperature_f"])
+        self.assertEqual(result["heat_pump_cop"], 3.0)
+
     def test_ev2a_selects_winter_partial_peak_rate(self):
         cfg = {
             "ecobee_climate_entity_id": "climate.hallway",
@@ -152,11 +211,16 @@ class ControllerTests(unittest.TestCase):
         client.get_state.side_effect = [
             {"attributes": {"hvac_action": "heating"}},
             {"state": "off", "last_changed": "2020-01-01T00:00:00+00:00"},
+            {
+                "state": "cloudy",
+                "attributes": {"temperature": 10, "temperature_unit": "°C"},
+            },
         ]
         cfg = dict(
             BASE_CONFIG,
             ecobee_climate_entity_id="climate.hallway",
             ecobee_aux_heat_entity_id="switch.aux",
+            ecobee_weather_entity_id="weather.hallway",
             ecobee_dry_run=True,
             ecobee_electricity_peak_rate_per_kwh=0.60,
             ecobee_min_dwell_minutes=30,
@@ -171,6 +235,7 @@ class ControllerTests(unittest.TestCase):
         )
 
         self.assertEqual(result["action"], "turn_on")
+        self.assertEqual(result["outdoor_temperature_f"], 50.0)
         client.set_switch.assert_not_called()
 
 

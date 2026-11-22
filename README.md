@@ -130,14 +130,17 @@ auxiliary-heat entity IDs using the `ecobee_*` settings in
 `config.yaml_template`.
 
 Keep `ecobee_dry_run: true` until the peak/off-peak electricity rates, gas rate,
-heat-pump COP, and furnace efficiency have been verified in the logs. OptiCharge
+heat-pump COP curve, and furnace efficiency have been verified in the logs. OptiCharge
 will not make a thermostat decision when required rate values are missing.
 
 The template includes PG&E EV2-A peak, partial-peak, and off-peak energy rates
 effective June 1, 2026, plus the November 1, 2026 G-1 baseline gas rate. These
 tariffs are seasonal and should be checked after PG&E rate revisions. The
-Carrier 58MXA furnace efficiency setting is 92% AFUE; the heat-pump COP remains
-an estimate until its model and performance data are configured.
+Carrier 58MXA furnace efficiency setting is 92% AFUE. The configured MRCOOL
+UHP18030-O / MCMP3036BOTB curve uses certified 5 F and 47 F performance and
+interpolates between them using the Ecobee weather entity. Because the existing
+Carrier blower is not the exact certified MRCOOL indoor match, the conservative
+5 F COP is used. If weather is unavailable, the fixed COP setting is used.
 
 Fedora:
 

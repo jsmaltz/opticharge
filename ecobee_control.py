@@ -80,6 +80,8 @@ class HeatingDecision:
     electric_heat_cost_per_kwh: float | None = None
     gas_heat_cost_per_kwh: float | None = None
     electricity_rate_per_kwh: float | None = None
+    heat_pump_cop: float | None = None
+    outdoor_temperature_f: float | None = None
     heat_call: bool = False
     battery_limited: bool = False
     ev_needs_charge: bool = False
@@ -99,6 +101,7 @@ def decide_aux_heat(
     solar_surplus_w: float,
     heat_call: bool,
     current_aux_heat: bool,
+    outdoor_temperature_f: float | None = None,
 ) -> HeatingDecision:
     gas_rate = cfg.get("ecobee_gas_rate_per_therm")
     if electricity_rate is None or gas_rate is None:
@@ -107,7 +110,7 @@ def decide_aux_heat(
     try:
         electricity_rate = float(electricity_rate)
         gas_rate = float(gas_rate)
-        cop = float(cfg.get("ecobee_heat_pump_cop", 3.0))
+        cop = heat_pump_cop(cfg, outdoor_temperature_f)
         furnace_efficiency = float(cfg.get("ecobee_furnace_efficiency", 0.95))
     except (TypeError, ValueError):
         return HeatingDecision(None, "invalid energy cost configuration", heat_call=heat_call)
@@ -167,11 +170,54 @@ def decide_aux_heat(
         electric_heat_cost_per_kwh=round(electric_cost, 4),
         gas_heat_cost_per_kwh=round(gas_cost, 4),
         electricity_rate_per_kwh=round(electricity_rate, 5),
+        heat_pump_cop=round(cop, 3),
+        outdoor_temperature_f=(
+            round(float(outdoor_temperature_f), 1)
+            if outdoor_temperature_f is not None
+            else None
+        ),
         heat_call=heat_call,
         battery_limited=battery_limited,
         ev_needs_charge=ev_needs_charge,
         solar_scarce=solar_scarce,
     )
+
+
+def heat_pump_cop(
+    cfg: dict[str, Any], outdoor_temperature_f: float | None
+) -> float:
+    """Return a temperature-adjusted COP, falling back to the fixed setting.
+
+    The configured curve is linearly interpolated and clamped at its endpoints.
+    Clamping avoids inventing performance beyond the certified data range.
+    """
+    fallback = float(cfg.get("ecobee_heat_pump_cop", 3.0))
+    curve = cfg.get("ecobee_heat_pump_cop_curve")
+    if outdoor_temperature_f is None or not isinstance(curve, list):
+        return fallback
+    try:
+        points = sorted(
+            (float(point["temperature_f"]), float(point["cop"]))
+            for point in curve
+        )
+        temperature = float(outdoor_temperature_f)
+    except (KeyError, TypeError, ValueError):
+        return fallback
+    if (
+        not points
+        or any(cop <= 0 for _, cop in points)
+        or len({temperature for temperature, _ in points}) != len(points)
+    ):
+        return fallback
+    if temperature <= points[0][0]:
+        return points[0][1]
+    if temperature >= points[-1][0]:
+        return points[-1][1]
+    for (low_temp, low_cop), (high_temp, high_cop) in zip(points, points[1:]):
+        if low_temp <= temperature <= high_temp:
+            fraction = (temperature - low_temp) / (high_temp - low_temp)
+            return low_cop + fraction * (high_cop - low_cop)
+    return fallback
 
 
 class EcobeeController:
@@ -180,6 +226,7 @@ class EcobeeController:
         self.client = client
         self.climate_entity = str(cfg["ecobee_climate_entity_id"])
         self.aux_entity = str(cfg["ecobee_aux_heat_entity_id"])
+        self.weather_entity = cfg.get("ecobee_weather_entity_id")
         self.dry_run = bool(cfg.get("ecobee_dry_run", True))
         self.min_dwell_s = max(0.0, float(cfg.get("ecobee_min_dwell_minutes", 30))) * 60.0
 
@@ -248,6 +295,19 @@ class EcobeeController:
     ) -> dict[str, Any]:
         climate = self.client.get_state(self.climate_entity)
         aux = self.client.get_state(self.aux_entity)
+        outdoor_temperature_f = None
+        if self.weather_entity:
+            try:
+                weather = self.client.get_state(str(self.weather_entity))
+                attributes = weather.get("attributes", {})
+                outdoor_temperature_f = float(attributes.get("temperature"))
+                if str(attributes.get("temperature_unit", "")).upper() in {
+                    "°C",
+                    "C",
+                }:
+                    outdoor_temperature_f = outdoor_temperature_f * 9.0 / 5.0 + 32.0
+            except (HomeAssistantError, TypeError, ValueError):
+                outdoor_temperature_f = None
         heat_call = climate.get("attributes", {}).get("hvac_action") == "heating"
         current_aux = aux.get("state") == "on"
         solar_surplus = float(readings.get("solar_power") or 0.0) - float(
@@ -263,6 +323,7 @@ class EcobeeController:
             solar_surplus_w=solar_surplus,
             heat_call=heat_call,
             current_aux_heat=current_aux,
+            outdoor_temperature_f=outdoor_temperature_f,
         )
         result = decision.as_dict()
         result.update(

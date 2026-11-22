@@ -49,6 +49,7 @@ home_assistant_token_file: ".home-assistant-token"
 home_assistant_timeout_s: 10
 ecobee_climate_entity_id: "climate.hallway_my_ecobee"
 ecobee_aux_heat_entity_id: "switch.hallway_my_ecobee_auxiliary_heat_only"
+ecobee_weather_entity_id: "weather.hallway_my_ecobee"
 # PG&E EV2-A tariff effective June 1, 2026. Check the current tariff before
 # deploying elsewhere or after a PG&E rate revision.
 ecobee_electric_rate_plan: "EV2-A"
@@ -62,6 +63,12 @@ ecobee_electricity_peak_rate_per_kwh: null
 ecobee_electricity_offpeak_rate_per_kwh: null
 ecobee_gas_rate_per_therm: 2.53545
 ecobee_heat_pump_cop: 3.0
+# MRCOOL UHP18030-O with MCMP3036BOTB cased coil. The 5 F value is the
+# conservative certified value across applicable indoor matches; values between
+# the test points are linearly interpolated. The fixed COP above is the fallback.
+ecobee_heat_pump_cop_curve:
+  - {temperature_f: 5, cop: 1.75}
+  - {temperature_f: 47, cop: 3.54}
 ecobee_furnace_efficiency: 0.92
 ecobee_cost_margin_fraction: 0.10
 ecobee_battery_limited_soc: 55

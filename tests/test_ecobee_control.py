@@ -50,6 +50,7 @@ class DecisionTests(unittest.TestCase):
 
         self.assertFalse(decision.desired_aux_heat)
         self.assertFalse(decision.ev_needs_charge)
+        self.assertIn("EV target is met", decision.reason)
 
     def test_does_not_switch_without_a_heat_call(self):
         decision = decide_aux_heat(

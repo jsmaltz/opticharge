@@ -149,14 +149,14 @@ def decide_aux_heat(
             heating_relevant,
         )
     )
-    facts = {
-        "gas cheaper": gas_is_cheaper,
-        "battery limited": battery_limited,
-        "EV below target": ev_needs_charge,
-        "solar scarce": solar_scarce,
-        "heat called": heating_relevant,
-    }
-    reason = ", ".join(name for name, value in facts.items() if not value)
+    checks = (
+        (gas_is_cheaper, "gas is not sufficiently cheaper"),
+        (battery_limited, "battery supply is not limited"),
+        (ev_needs_charge, "EV target is met"),
+        (solar_scarce, "solar surplus is available"),
+        (heating_relevant, "no active heat call"),
+    )
+    reason = "; ".join(message for passed, message in checks if not passed)
     if use_aux:
         reason = "gas heat is cheaper and electricity is reserved for battery/EV"
     elif not reason:

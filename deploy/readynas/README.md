@@ -57,6 +57,12 @@ cd /apps/opticharge/app
 sh deploy/readynas/update-app.sh
 ```
 
+Do not copy a workstation `config.yaml` over the NAS during an update. The NAS
+file contains deployment-only credentials and settings that are intentionally
+absent from the repository and may also be absent from a local working copy.
+Use the update script for code changes, then merge any new template settings
+into the NAS config without replacing its existing values.
+
 The update script:
 
 - refuses to run if tracked files have local changes
